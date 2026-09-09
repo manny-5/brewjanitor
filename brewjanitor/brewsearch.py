@@ -35,6 +35,11 @@ from .brewcheck import Brew
 from .inventory import App
 
 
+def _is_cask_candidate(raw: str) -> bool:
+    """True if a brew search line is a cask (suffixed ` (cask)`)."""
+    return raw.strip().endswith("(cask)")
+
+
 @dataclasses.dataclass(frozen=True)
 class AppCandidate:
     """An app plus whether Homebrew could install it.
@@ -177,8 +182,30 @@ def _evaluate(
     return AppCandidate(app=app, installable=False, brew_name="", brew_kind="", verified=False)
 
 
+def _offline_evaluate(app: App, candidates: list[str]) -> AppCandidate:
+    """Fast path: pick a cask by name only, with no `brew info` network call.
+
+    We trust a same-named cask candidate (e.g. app "Firefox" -> candidate
+    "firefox (cask)") without verifying its artifacts. This is much faster (no
+    per-candidate brew info) but always unverified, so piece 4 will be cautious.
+    """
+    term = _app_name_lower(app)
+    for raw in candidates:
+        if not _is_cask_candidate(raw):
+            continue
+        name = _clean_candidate(raw)
+        if name == term:
+            return AppCandidate(
+                app=app, installable=True, brew_name=name, brew_kind="cask", verified=False
+            )
+    return AppCandidate(app=app, installable=False, brew_name="", brew_kind="", verified=False)
+
+
 def search(
-    apps: list[App], brew: Brew | None = None
+    apps: list[App],
+    brew: Brew | None = None,
+    offline: bool = False,
+    progress: bool = False,
 ) -> list[AppCandidate]:
     """For each App, decide whether Homebrew could install it.
 
@@ -187,6 +214,11 @@ def search(
             check, but any App list is accepted.
         brew: optional Brew wrapper (e.g. a test fake). Defaults to a real Brew
             discovered on PATH.
+        offline: when True, skip the per-candidate `brew info` network calls and
+            match casks by name only (much faster, but every result is
+            `verified=False`). Default False uses the full verified path.
+        progress: when True, print one line per app to stderr as it is processed,
+            so a long scan shows it is moving instead of appearing stuck.
 
     Returns:
         One AppCandidate per input App, in the same order. Always returns; never
@@ -199,10 +231,16 @@ def search(
             for a in apps
         ]
 
+    total = len(apps)
     results: list[AppCandidate] = []
-    for app in apps:
+    for index, app in enumerate(apps, start=1):
+        if progress:
+            print(f"searching [{index}/{total}] {app.name} ...", file=sys.stderr, flush=True)
         candidates = brew.search(_search_term(app))
-        results.append(_evaluate(app, candidates, brew))
+        if offline:
+            results.append(_offline_evaluate(app, candidates))
+        else:
+            results.append(_evaluate(app, candidates, brew))
     return results
 
 

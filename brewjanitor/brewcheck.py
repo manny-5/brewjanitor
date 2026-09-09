@@ -66,6 +66,11 @@ class Brew:
 
     def __init__(self, brew_path: str | None = None) -> None:
         self._brew = brew_path or shutil.which("brew") or ""
+        # Caches for read-only metadata queries so duplicate candidates across
+        # many apps don't each pay the brew subprocess + network cost. This is
+        # the single biggest speedup for a 40-app scan.
+        self._info_any_cache: dict[str, dict | None] = {}
+        self._search_cache: dict[str, list[str]] = {}
 
     @property
     def available(self) -> bool:
@@ -125,30 +130,42 @@ class Brew:
 
         Unlike info_json, this does not require the item to be installed: it
         contacts the taps to describe whatever brew knows about `name` (formula
-        or cask). Still read-only; it only reads metadata. Returns None on any
-        failure or when brew cannot resolve the name.
+        or cask). Still read-only; it only reads metadata. Results are cached per
+        name so the same candidate is not re-queried across many apps. Returns
+        None on any failure or when brew cannot resolve the name.
         """
         if not self.available:
             return None
+        if name in self._info_any_cache:
+            return self._info_any_cache[name]
         result = self._run(["info", "--json=v2", name])
         if result.returncode != 0 or not result.stdout.strip():
+            self._info_any_cache[name] = None
             return None
         try:
-            return json.loads(result.stdout)
+            payload = json.loads(result.stdout)
         except json.JSONDecodeError:
+            self._info_any_cache[name] = None
             return None
+        self._info_any_cache[name] = payload
+        return payload
 
     def search(self, term: str) -> list[str]:
         """Return brew search results (formula + cask names) for a term.
 
         `brew search` is read-only: it queries local taps and prints matching
         formula/cask names, one per line, with casks suffixed ` (cask)`. We strip
-        that suffix to return bare names. Empty if brew is unavailable.
+        that suffix to return bare names. Results are cached per term so two apps
+        that derive the same search term share one brew call. Empty if brew is
+        unavailable.
         """
         if not self.available:
             return []
+        if term in self._search_cache:
+            return self._search_cache[term]
         result = self._run(["search", term])
         if result.returncode != 0:
+            self._search_cache[term] = []
             return []
         names: list[str] = []
         for line in result.stdout.splitlines():
@@ -158,6 +175,7 @@ class Brew:
             if line.startswith("==>"):
                 continue
             names.append(line)
+        self._search_cache[term] = names
         return names
 
     # ------------------------------------------------------------------

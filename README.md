@@ -25,7 +25,18 @@ Requires Python 3.9+ and [Homebrew](https://brew.sh).
 brewjanitor                      # dry-run: print the plan, change nothing
 brewjanitor --apply              # install via brew, verify, remove old bundles
 brewjanitor --report PATH.csv    # write the couldn't-be-replaced apps to PATH
+brewjanitor --verbose            # print per-app progress during the search step
+brewjanitor --offline            # fast path: name-only cask match, no brew info network calls
 ```
+
+The search step (deciding which unmanaged apps *could* be installed via
+Homebrew) shells out to `brew` per app and, by default, queries `brew info` per
+candidate -- which can take minutes for many apps. Two options make it faster:
+
+- `--verbose` prints one line per app so you can see it moving.
+- `--offline` skips the per-candidate `brew info` network calls and matches
+  casks by name only (seconds, not minutes), but every candidate is `unverified`,
+  so `--apply` will be more cautious.
 
 ## How it works (piece by piece)
 

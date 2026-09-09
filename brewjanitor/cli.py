@@ -45,10 +45,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "Defaults to ./brewjanitor-unreplaced.csv when --apply is used; in "
         "dry-run the report is still written to that default path.",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Fast path: skip the per-candidate `brew info` network calls and match "
+        "casks by name only. Much faster (seconds vs minutes for many apps) but "
+        "every candidate is unverified, so --apply will be more cautious.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print per-app progress as the search step runs, so a long scan shows "
+        "it is moving instead of appearing stuck.",
+    )
     return parser
 
 
-def run(apply: bool, report_path: str | None) -> int:
+def run(apply: bool, report_path: str | None, offline: bool = False, verbose: bool = False) -> int:
     """Run the full pipeline. Returns a process exit code."""
     brew = Brew()
     if not brew.available:
@@ -70,7 +83,7 @@ def run(apply: bool, report_path: str | None) -> int:
         file=sys.stderr,
     )
 
-    candidates = search(unmanaged_apps, brew)
+    candidates = search(unmanaged_apps, brew, offline=offline, progress=verbose)
     installable = [c for c in candidates if c.installable]
     not_installable = [c for c in candidates if not c.installable]
     print(
@@ -119,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
     """`brewjanitor` entry point (see pyproject [project.scripts])."""
     parser = _build_parser()
     args = parser.parse_args(argv)
-    return run(apply=args.apply, report_path=args.report)
+    return run(apply=args.apply, report_path=args.report, offline=args.offline, verbose=args.verbose)
 
 
 if __name__ == "__main__":
