@@ -102,10 +102,12 @@ class Brew:
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     def info_json(self, name: str, is_cask: bool) -> dict | None:
-        """Return the parsed `brew info --json=v2` payload for one item, or None.
+        """Return the parsed `brew info --json=v2 --installed` payload for one item.
 
         `--installed` keeps this read-only and fast: it only describes what is
-        already on disk rather than contacting taps.
+        already on disk rather than contacting taps. Use info_json_any when you
+        need information about items that may not be installed yet (e.g. search
+        candidates).
         """
         if not self.available:
             return None
@@ -117,6 +119,46 @@ class Brew:
             return json.loads(result.stdout)
         except json.JSONDecodeError:
             return None
+
+    def info_json_any(self, name: str) -> dict | None:
+        """Return the parsed `brew info --json=v2` payload for any brew item.
+
+        Unlike info_json, this does not require the item to be installed: it
+        contacts the taps to describe whatever brew knows about `name` (formula
+        or cask). Still read-only; it only reads metadata. Returns None on any
+        failure or when brew cannot resolve the name.
+        """
+        if not self.available:
+            return None
+        result = self._run(["info", "--json=v2", name])
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+
+    def search(self, term: str) -> list[str]:
+        """Return brew search results (formula + cask names) for a term.
+
+        `brew search` is read-only: it queries local taps and prints matching
+        formula/cask names, one per line, with casks suffixed ` (cask)`. We strip
+        that suffix to return bare names. Empty if brew is unavailable.
+        """
+        if not self.available:
+            return []
+        result = self._run(["search", term])
+        if result.returncode != 0:
+            return []
+        names: list[str] = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("==>"):
+                continue
+            names.append(line)
+        return names
 
 
 def _normalize(path: str) -> str:
