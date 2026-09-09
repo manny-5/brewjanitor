@@ -223,7 +223,11 @@ def _cask_app_paths(info: dict) -> list[str]:
 
     Cask JSON shape: casks[].artifacts[].app[] (strings) and/or
     casks[].artifacts[].{ "app": [...] }. We collect any string that ends with
-    .app and any path under artifacts.uninstall that points at an .app.
+    .app. brew info reports these as the install name (e.g. "Firefox.app") which
+    the cask installs into its appdir (casks[].artifacts[] can carry an explicit
+    "app" target, but the default appdir is /Applications). Callers must anchor a
+    relative name against the appdir before comparing to an absolute inventory
+    path -- see _build_brew_ownership.
     """
     paths: list[str] = []
     for cask in info.get("casks", []):
@@ -238,6 +242,25 @@ def _cask_app_paths(info: dict) -> list[str]:
                 if isinstance(item, str) and item.endswith(".app"):
                     paths.append(item)
     return paths
+
+
+def _cask_appdir(info: dict) -> str:
+    """Return the directory a cask installs .app bundles into.
+
+    brew info exposes this as casks[].artifacts[].{ "app": { "target": ... } } in
+    newer Homebrew, or defaults to "/Applications". We scan for an explicit app
+    target and fall back to /Applications so a relative artifact name like
+    "Firefox.app" can be resolved to an absolute path for matching.
+    """
+    for cask in info.get("casks", []):
+        for artifact in cask.get("artifacts", []) or []:
+            if isinstance(artifact, dict):
+                app = artifact.get("app")
+                if isinstance(app, dict):
+                    target = app.get("target")
+                    if isinstance(target, str) and target:
+                        return target
+    return "/Applications"
 
 
 def _formula_paths(info: dict) -> list[str]:
@@ -258,30 +281,54 @@ def _formula_paths(info: dict) -> list[str]:
     return paths
 
 
-def _build_brew_ownership(brew: Brew) -> dict[str, tuple[str, str]]:
-    """Map normalized bundle path -> (brew_name, kind) for everything brew owns.
+def _resolve_artifact(raw: str, appdir: str) -> str:
+    """Turn a cask artifact name into an absolute path for matching.
 
-    Only casks reliably produce .app paths, so they dominate this map. Formulae
-    contribute too, but most formula entries will not collide with an inventory
-    bundle path and are simply ignored at lookup time.
+    brew info reports app artifacts as the install name (e.g. "Firefox.app")
+    which lives in the cask's appdir. Resolving a relative name directly would
+    anchor it against the *current working directory* (wrong), so we anchor it
+    against appdir. Absolute artifacts are passed through unchanged.
     """
-    owned: dict[str, tuple[str, str]] = {}
+    if os.path.isabs(raw):
+        return raw
+    return os.path.join(appdir, raw)
+
+
+def _build_brew_ownership(brew: Brew) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
+    """Build two indexes of everything Homebrew owns.
+
+    Returns (by_path, by_basename):
+      by_path: normalized absolute bundle path -> (brew_name, kind). Preferred.
+      by_basename: lowercase .app filename -> (brew_name, kind). Fallback used
+      when the cask only reports a relative artifact name we cannot anchor with
+      full confidence (e.g. an appdir we did not detect). Matching by basename is
+      less precise but catches the common case where an app sits in
+      /Applications under the same name the cask installed.
+
+    Only casks reliably produce .app paths, so they dominate. Formulae contribute
+    to by_path only.
+    """
+    by_path: dict[str, tuple[str, str]] = {}
+    by_basename: dict[str, tuple[str, str]] = {}
 
     for cask in brew.list_casks():
         info = brew.info_json(cask, is_cask=True)
         if not info:
             continue
+        appdir = _cask_appdir(info)
         for raw in _cask_app_paths(info):
-            owned.setdefault(_normalize(raw), (cask, "cask"))
+            absolute = _resolve_artifact(raw, appdir)
+            by_path.setdefault(_normalize(absolute), (cask, "cask"))
+            by_basename.setdefault(os.path.basename(raw).lower(), (cask, "cask"))
 
     for formula in brew.list_formulae():
         info = brew.info_json(formula, is_cask=False)
         if not info:
             continue
         for raw in _formula_paths(info):
-            owned.setdefault(_normalize(raw), (formula, "formula"))
+            by_path.setdefault(_normalize(raw), (formula, "formula"))
 
-    return owned
+    return by_path, by_basename
 
 
 def check(apps: list[App], brew: Brew | None = None) -> list[CheckedApp]:
@@ -300,11 +347,19 @@ def check(apps: list[App], brew: Brew | None = None) -> list[CheckedApp]:
     if not brew.available:
         return [CheckedApp(app=a, brew_managed=False, brew_name="", brew_kind="") for a in apps]
 
-    owned = _build_brew_ownership(brew)
+    by_path, by_basename = _build_brew_ownership(brew)
 
     checked: list[CheckedApp] = []
     for a in apps:
-        match = owned.get(_normalize(a.path))
+        # Preferred: match on the full resolved path. This is exact and handles
+        # cask symlinks into the Caskroom.
+        match = by_path.get(_normalize(a.path))
+        # Fallback: match on the .app basename. This catches the common case
+        # where the cask reported only a relative name ("Firefox.app") and our
+        # appdir detection did not yield the exact install location. The
+        # basename of an installed app is usually unique enough to be safe here.
+        if match is None and a.name:
+            match = by_basename.get(a.name.lower())
         if match:
             name, kind = match
             checked.append(CheckedApp(app=a, brew_managed=True, brew_name=name, brew_kind=kind))
