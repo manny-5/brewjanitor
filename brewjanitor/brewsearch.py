@@ -114,80 +114,14 @@ def _app_name_lower(app: App) -> str:
     return name.lower()
 
 
-def _evaluate(
-    app: App, candidates: list[str], brew: Brew
-) -> AppCandidate:
-    """Pick the best brew candidate for one app from its search results.
+def _pick_cask_by_name(app: App, candidates: list[str]) -> str | None:
+    """Return the cask name that matches the app's normalized name, or None.
 
-    Prefers casks (apps install via casks), and among casks prefers one that
-    matches the app by bundle id or by the .app artifact filename. Falls back
-    to any resolvable cask candidate (verified=False), then any formula
-    candidate (apps rarely install from formulae, so formula matches are only
-    accepted as a last resort and marked unverified).
-    """
-    term = _app_name_lower(app)
-    fallback_cask: tuple[str, bool] | None = None
-    fallback_formula: tuple[str, bool] | None = None
-
-    for raw in candidates:
-        name = _clean_candidate(raw)
-        if not name:
-            continue
-        info = brew.info_json_any(name)
-        if not info:
-            continue
-
-        # Cask path: check artifacts for a path/bundle_id match against the app.
-        if info.get("casks"):
-            for app_path, bid in _cask_app_artifacts(info):
-                art_name = Path(app_path).name
-                if app.bundle_id and bid and bid == app.bundle_id:
-                    return AppCandidate(
-                        app=app,
-                        installable=True,
-                        brew_name=name,
-                        brew_kind="cask",
-                        verified=True,
-                    )
-                if art_name.lower() == app.name.lower():
-                    return AppCandidate(
-                        app=app,
-                        installable=True,
-                        brew_name=name,
-                        brew_kind="cask",
-                        verified=True,
-                    )
-            if fallback_cask is None and name == term:
-                fallback_cask = (name, False)
-
-        # Formula path: only accept as a low-confidence last resort.
-        if info.get("formulae") and fallback_formula is None and name == term:
-            fallback_formula = (name, False)
-
-    if fallback_cask is not None:
-        name, verified = fallback_cask
-        return AppCandidate(
-            app=app, installable=True, brew_name=name, brew_kind="cask", verified=verified
-        )
-    if fallback_formula is not None:
-        name, verified = fallback_formula
-        return AppCandidate(
-            app=app,
-            installable=True,
-            brew_name=name,
-            brew_kind="formula",
-            verified=verified,
-        )
-
-    return AppCandidate(app=app, installable=False, brew_name="", brew_kind="", verified=False)
-
-
-def _offline_evaluate(app: App, candidates: list[str]) -> AppCandidate:
-    """Fast path: pick a cask by name only, with no `brew info` network call.
-
-    We trust a same-named cask candidate (e.g. app "Firefox" -> candidate
-    "firefox (cask)") without verifying its artifacts. This is much faster (no
-    per-candidate brew info) but always unverified, so piece 4 will be cautious.
+    This is the fast path: no `brew info` network call. Casks install apps, so
+    we only consider cask candidates (lines suffixed ` (cask)`) whose cleaned
+    name equals the app's hyphenated lowercased name. A name match alone is not
+    enough to call something `verified` -- that requires a brew info artifact
+    check -- but it is enough to decide the app is installable.
     """
     term = _app_name_lower(app)
     for raw in candidates:
@@ -195,9 +129,65 @@ def _offline_evaluate(app: App, candidates: list[str]) -> AppCandidate:
             continue
         name = _clean_candidate(raw)
         if name == term:
+            return name
+    return None
+
+
+def _verify_cask(app: App, brew: Brew, name: str) -> bool:
+    """True if cask `name` installs an app matching `app` by bundle id or path.
+
+    This is the (slow, network) verification step: `brew info --json=v2 <name>`.
+    It is only called when a caller needs the `verified` flag -- i.e. right
+    before an actual install under --apply. A dry run never needs it.
+    """
+    info = brew.info_json_any(name)
+    if not info or not info.get("casks"):
+        return False
+    for app_path, bid in _cask_app_artifacts(info):
+        if app.bundle_id and bid and bid == app.bundle_id:
+            return True
+        if Path(app_path).name.lower() == app.name.lower():
+            return True
+    return False
+
+
+def _evaluate(
+    app: App, candidates: list[str], brew: Brew, verify: bool = False
+) -> AppCandidate:
+    """Pick the best brew candidate for one app from its search results.
+
+    Fast by default: a cask whose name matches the app is accepted as
+    installable (verified=False) with no `brew info` call. When `verify` is
+    True (e.g. right before --apply), the chosen cask is confirmed via
+    `brew info` against the app's bundle id or .app filename, and verified is
+    set accordingly. Formula candidates are only accepted as a last resort.
+    """
+    # Preferred: a same-named cask.
+    cask_name = _pick_cask_by_name(app, candidates)
+    if cask_name is not None:
+        verified = _verify_cask(app, brew, cask_name) if verify else False
+        return AppCandidate(
+            app=app,
+            installable=True,
+            brew_name=cask_name,
+            brew_kind="cask",
+            verified=verified,
+        )
+
+    # Last resort: a same-named formula (apps rarely install from formulae).
+    term = _app_name_lower(app)
+    for raw in candidates:
+        if _is_cask_candidate(raw):
+            continue
+        if _clean_candidate(raw) == term:
             return AppCandidate(
-                app=app, installable=True, brew_name=name, brew_kind="cask", verified=False
+                app=app,
+                installable=True,
+                brew_name=term,
+                brew_kind="formula",
+                verified=False,
             )
+
     return AppCandidate(app=app, installable=False, brew_name="", brew_kind="", verified=False)
 
 
@@ -205,6 +195,7 @@ def search(
     apps: list[App],
     brew: Brew | None = None,
     offline: bool = False,
+    verify: bool = False,
     progress: bool = False,
 ) -> list[AppCandidate]:
     """For each App, decide whether Homebrew could install it.
@@ -214,9 +205,13 @@ def search(
             check, but any App list is accepted.
         brew: optional Brew wrapper (e.g. a test fake). Defaults to a real Brew
             discovered on PATH.
-        offline: when True, skip the per-candidate `brew info` network calls and
-            match casks by name only (much faster, but every result is
-            `verified=False`). Default False uses the full verified path.
+        offline: when True, force verify=False (no per-candidate `brew info`
+            calls). The default path is already fast: name matching needs no
+            `brew info`. Kept for the existing --offline flag.
+        verify: when True, confirm each matched cask via `brew info` (network)
+            so the `verified` flag reflects a real artifact match. Only needed
+            before an actual install (e.g. under --apply); a dry run never needs
+            it, which is why dry runs are now fast by default.
         progress: when True, print one line per app to stderr as it is processed,
             so a long scan shows it is moving instead of appearing stuck.
 
@@ -237,10 +232,7 @@ def search(
         if progress:
             print(f"searching [{index}/{total}] {app.name} ...", file=sys.stderr, flush=True)
         candidates = brew.search(_search_term(app))
-        if offline:
-            results.append(_offline_evaluate(app, candidates))
-        else:
-            results.append(_evaluate(app, candidates, brew))
+        results.append(_evaluate(app, candidates, brew, verify=verify and not offline))
     return results
 
 

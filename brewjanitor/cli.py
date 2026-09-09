@@ -41,16 +41,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--report",
         metavar="PATH",
         default=None,
-        help="Write the couldn't-be-replaced apps to this CSV path. "
-        "Defaults to ./brewjanitor-unreplaced.csv when --apply is used; in "
-        "dry-run the report is still written to that default path.",
+        help="Write the couldn't-be-replaced apps to this CSV path. Only written "
+        "under --apply (default path ./brewjanitor-unreplaced.csv) or when you pass "
+        "this flag explicitly; a plain dry-run writes no files.",
     )
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Fast path: skip the per-candidate `brew info` network calls and match "
-        "casks by name only. Much faster (seconds vs minutes for many apps) but "
-        "every candidate is unverified, so --apply will be more cautious.",
+        help="Skip the `brew info` verification calls even under --apply, matching casks "
+        "by name only. Dry runs are already name-only and fast; this flag only "
+        "affects --apply by leaving candidates unverified.",
     )
     parser.add_argument(
         "--verbose",
@@ -83,7 +83,9 @@ def run(apply: bool, report_path: str | None, offline: bool = False, verbose: bo
         file=sys.stderr,
     )
 
-    candidates = search(unmanaged_apps, brew, offline=offline, progress=verbose)
+    candidates = search(
+        unmanaged_apps, brew, offline=offline, verify=apply, progress=verbose
+    )
     installable = [c for c in candidates if c.installable]
     not_installable = [c for c in candidates if not c.installable]
     print(
@@ -108,19 +110,30 @@ def run(apply: bool, report_path: str | None, offline: bool = False, verbose: bo
             f"({res.brew_kind} {res.brew_name}) -> {res.reason}"
         )
 
-    # Report: every unmanaged-not-installable app.
-    entries = [
-        ReportEntry(
-            app=c.app,
-            brew_name=c.brew_name,
-            brew_kind=c.brew_kind,
-            reason="not installable via Homebrew",
-        )
-        for c in not_installable
-    ]
-    out_path = report_path if report_path is not None else "brewjanitor-unreplaced.csv"
-    count = write_report(entries, out_path)
-    print(f"\nWrote {count} unreplaced app(s) to {out_path}", file=sys.stderr)
+    # Report: every unmanaged-not-installable app. A dry-run does NOT write a
+    # file (it should not touch the user's working directory); the report is
+    # only written under --apply, or whenever the user passes --report PATH to
+    # opt into a file even in dry-run.
+    if apply or report_path is not None:
+        entries = [
+            ReportEntry(
+                app=c.app,
+                brew_name=c.brew_name,
+                brew_kind=c.brew_kind,
+                reason="not installable via Homebrew",
+            )
+            for c in not_installable
+        ]
+        out_path = report_path if report_path is not None else "brewjanitor-unreplaced.csv"
+        count = write_report(entries, out_path)
+        print(f"\nWrote {count} unreplaced app(s) to {out_path}", file=sys.stderr)
+    else:
+        if not_installable:
+            print(
+                f"\n{len(not_installable)} app(s) could not be replaced; re-run with "
+                "--report PATH.csv (or --apply) to write the list to a file.",
+                file=sys.stderr,
+            )
 
     # Exit non-zero if any apply step failed, so scripts/CIs can detect it.
     if apply and any(r.status == "failed" for r in results):

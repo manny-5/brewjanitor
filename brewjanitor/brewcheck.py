@@ -36,7 +36,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .inventory import App
+# How long a single read-only brew call may take before we give up and treat it
+# as failed. Keeps a hung tap fetch from hanging the whole tool forever.
+BREW_TIMEOUT = 60.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,16 +79,30 @@ class Brew:
         """True if a `brew` executable was found on PATH."""
         return bool(self._brew)
 
-    def _run(self, args: list[str]) -> subprocess.CompletedProcess[str]:
-        """Run a brew command, capturing output. Never raises; failures map to
-        a non-zero return code the caller inspects."""
-        return subprocess.run(
-            [self._brew, *args],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+    def _run(self, args: list[str], timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        """Run a brew command, capturing output. Never raises; failures (including
+        a timeout) map to a non-zero return code the caller inspects.
+
+        The timeout keeps a single hung brew call (e.g. a tap fetch stuck on a
+        flaky network) from hanging the whole tool forever. A timed-out call
+        returns a synthetic failure with a stderr note instead of raising.
+        """
+        try:
+            return subprocess.run(
+                [self._brew, *args],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return subprocess.CompletedProcess(
+                args=[self._brew, *args],
+                returncode=124,
+                stdout="",
+                stderr=f"brew timed out after {timeout}s: {' '.join(args)}",
+            )
 
     def list_formulae(self) -> list[str]:
         """Installed formulae by name. Empty if brew is unavailable."""
@@ -117,13 +133,41 @@ class Brew:
         if not self.available:
             return None
         scope = "--cask" if is_cask else "--formula"
-        result = self._run(["info", scope, "--json=v2", "--installed", name])
+        result = self._run(
+            ["info", scope, "--json=v2", "--installed", name], timeout=BREW_TIMEOUT
+        )
         if result.returncode != 0 or not result.stdout.strip():
             return None
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError:
             return None
+
+    def info_installed_all(self, is_cask: bool) -> list[dict]:
+        """Return the parsed `brew info --json=v2 --installed` payloads for ALL
+        installed items of one kind in a SINGLE brew call.
+
+        Calling info_json once per cask is O(n) slow subprocess calls; this is
+        O(1). Returns the list of per-item dicts (each shaped like the value of
+        info_json's `casks`/`formulae` key). Empty list on any failure. This is
+        the single biggest speedup for the brew check on a machine with many
+        installed casks.
+        """
+        if not self.available:
+            return []
+        scope = "--cask" if is_cask else "--formula"
+        result = self._run(
+            ["info", scope, "--json=v2", "--installed"], timeout=BREW_TIMEOUT
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return []
+        key = "casks" if is_cask else "formulae"
+        items = payload.get(key, [])
+        return items if isinstance(items, list) else []
 
     def info_json_any(self, name: str) -> dict | None:
         """Return the parsed `brew info --json=v2` payload for any brew item.
@@ -138,7 +182,7 @@ class Brew:
             return None
         if name in self._info_any_cache:
             return self._info_any_cache[name]
-        result = self._run(["info", "--json=v2", name])
+        result = self._run(["info", "--json=v2", name], timeout=BREW_TIMEOUT)
         if result.returncode != 0 or not result.stdout.strip():
             self._info_any_cache[name] = None
             return None
@@ -163,7 +207,7 @@ class Brew:
             return []
         if term in self._search_cache:
             return self._search_cache[term]
-        result = self._run(["search", term])
+        result = self._run(["search", term], timeout=BREW_TIMEOUT)
         if result.returncode != 0:
             self._search_cache[term] = []
             return []
@@ -294,6 +338,34 @@ def _resolve_artifact(raw: str, appdir: str) -> str:
     return os.path.join(appdir, raw)
 
 
+def _cask_artifact_names(cask: dict) -> list[str]:
+    """The .app install names for ONE cask dict (an element of the casks[] list)."""
+    names: list[str] = []
+    for artifact in cask.get("artifacts", []) or []:
+        if isinstance(artifact, dict):
+            apps = artifact.get("app", [])
+        elif isinstance(artifact, list):
+            apps = artifact
+        else:
+            apps = []
+        for item in apps:
+            if isinstance(item, str) and item.endswith(".app"):
+                names.append(item)
+    return names
+
+
+def _cask_appdir_one(cask: dict) -> str:
+    """The install appdir for ONE cask dict, defaulting to /Applications."""
+    for artifact in cask.get("artifacts", []) or []:
+        if isinstance(artifact, dict):
+            app = artifact.get("app")
+            if isinstance(app, dict):
+                target = app.get("target")
+                if isinstance(target, str) and target:
+                    return target
+    return "/Applications"
+
+
 def _build_brew_ownership(brew: Brew) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
     """Build two indexes of everything Homebrew owns.
 
@@ -305,30 +377,59 @@ def _build_brew_ownership(brew: Brew) -> tuple[dict[str, tuple[str, str]], dict[
       less precise but catches the common case where an app sits in
       /Applications under the same name the cask installed.
 
-    Only casks reliably produce .app paths, so they dominate. Formulae contribute
-    to by_path only.
+    Efficiency: this uses ONE `brew info --json=v2 --installed --cask` and ONE
+    `... --formula` call to describe all installed items at once, instead of one
+    brew call per item. If that batched call fails we fall back to per-item
+    info_json so a partial brew state still yields correct (if slower) results.
     """
     by_path: dict[str, tuple[str, str]] = {}
     by_basename: dict[str, tuple[str, str]] = {}
 
-    for cask in brew.list_casks():
-        info = brew.info_json(cask, is_cask=True)
-        if not info:
-            continue
-        appdir = _cask_appdir(info)
-        for raw in _cask_app_paths(info):
-            absolute = _resolve_artifact(raw, appdir)
-            by_path.setdefault(_normalize(absolute), (cask, "cask"))
-            by_basename.setdefault(os.path.basename(raw).lower(), (cask, "cask"))
+    casks = brew.info_installed_all(is_cask=True)
+    if not casks:
+        # Fallback to per-cask calls if the single batched call failed.
+        for name in brew.list_casks():
+            info = brew.info_json(name, is_cask=True)
+            if not info:
+                continue
+            for cask in info.get("casks", []):
+                _index_one_cask(cask, by_path, by_basename)
+    else:
+        for cask in casks:
+            _index_one_cask(cask, by_path, by_basename)
 
-    for formula in brew.list_formulae():
-        info = brew.info_json(formula, is_cask=False)
-        if not info:
-            continue
-        for raw in _formula_paths(info):
-            by_path.setdefault(_normalize(raw), (formula, "formula"))
+    formulae = brew.info_installed_all(is_cask=False)
+    if not formulae:
+        for name in brew.list_formulae():
+            info = brew.info_json(name, is_cask=False)
+            if not info:
+                continue
+            for formula in info.get("formulae", []):
+                for raw in _formula_paths({"formulae": [formula]}):
+                    by_path.setdefault(_normalize(raw), (formula.get("full_name") or name, "formula"))
+    else:
+        for formula in formulae:
+            fname = formula.get("full_name") or formula.get("name") or ""
+            for keg in formula.get("installed", []) or []:
+                prefix = keg.get("installed_as_dependency_path") or keg.get("installed_on", {})
+                if isinstance(prefix, dict):
+                    prefix = prefix.get("path")
+                if isinstance(prefix, str) and prefix:
+                    by_path.setdefault(_normalize(prefix), (fname, "formula"))
 
     return by_path, by_basename
+
+
+def _index_one_cask(cask: dict, by_path: dict[str, tuple[str, str]], by_basename: dict[str, tuple[str, str]]) -> None:
+    """Add one cask dict's installed apps to both ownership indexes."""
+    name = cask.get("token") or cask.get("full_name") or cask.get("name") or ""
+    if not isinstance(name, str) or not name:
+        return
+    appdir = _cask_appdir_one(cask)
+    for raw in _cask_artifact_names(cask):
+        absolute = _resolve_artifact(raw, appdir)
+        by_path.setdefault(_normalize(absolute), (name, "cask"))
+        by_basename.setdefault(os.path.basename(raw).lower(), (name, "cask"))
 
 
 def check(apps: list[App], brew: Brew | None = None) -> list[CheckedApp]:
