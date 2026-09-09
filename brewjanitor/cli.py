@@ -64,13 +64,13 @@ def run(apply: bool, report_path: str | None) -> int:
 
     checked = check(apps, brew)
     managed = [c for c in checked if c.brew_managed]
-    unmanaged = [c for c in checked if not c.brew_managed]
+    unmanaged_apps = [c.app for c in checked if not c.brew_managed]
     print(
-        f"Homebrew manages {len(managed)}; {len(unmanaged)} are unmanaged.",
+        f"Homebrew manages {len(managed)}; {len(unmanaged_apps)} are unmanaged.",
         file=sys.stderr,
     )
 
-    candidates = search(unmanaged, brew)
+    candidates = search(unmanaged_apps, brew)
     installable = [c for c in candidates if c.installable]
     not_installable = [c for c in candidates if not c.installable]
     print(
