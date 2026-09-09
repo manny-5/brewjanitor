@@ -160,6 +160,33 @@ class Brew:
             names.append(line)
         return names
 
+    # ------------------------------------------------------------------
+    # Mutating operations. Unlike the read-only methods above, these change
+    # the system. They MUST be gated behind an explicit user opt-in (the
+    # --apply flag) by callers; the wrapper itself does not enforce that.
+    # ------------------------------------------------------------------
+    def install(self, name: str, is_cask: bool) -> subprocess.CompletedProcess[str]:
+        """Install a formula (`brew install`) or cask (`brew install --cask`).
+
+        This is a mutating operation: callers are responsible for only invoking
+        it when the user has explicitly opted in (e.g. --apply). It returns the
+        raw completed process so callers can inspect the return code and stderr
+        to decide whether the install actually succeeded.
+        """
+        args = ["install", "--cask", name] if is_cask else ["install", name]
+        return self._run(args)
+
+    def uninstall(self, name: str, is_cask: bool) -> subprocess.CompletedProcess[str]:
+        """Uninstall a formula or cask. Mutating; caller-gated like install().
+
+        Note: brewjanitor's replace step intentionally does NOT call this for
+        the original app bundle, because the bundle is not a brew item to begin
+        with -- it is removed from disk directly. This method is provided for
+        completeness and rollback scenarios.
+        """
+        args = ["uninstall", "--cask", name] if is_cask else ["uninstall", name]
+        return self._run(args)
+
 
 def _normalize(path: str) -> str:
     """Resolve symlinks for stable path comparison.
