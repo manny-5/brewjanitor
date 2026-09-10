@@ -43,6 +43,7 @@ from pathlib import Path
 from .brewcheck import Brew
 from .brewsearch import AppCandidate
 from .inventory import App, DEFAULT_SCAN_DIRS
+from .streams import err as _err, out as _out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,7 +164,7 @@ def reconcile(
             for a in apps
         ]
 
-    by_path, _ = _build_brew_ownership(brew)
+    by_path, _, _ = _build_brew_ownership(brew)
 
     # Map bundle_id -> brew_name for every installed cask that reports one.
     by_bundle_id: dict[str, str] = {}
@@ -488,12 +489,12 @@ def main() -> int:
 
     brew = Brew()
     if not brew.available:
-        print("brew not found on PATH; nothing to replace.", file=sys.stderr)
+        _err("brew not found on PATH; nothing to replace.")
     unmanaged = [c.app for c in check(inventory(), brew) if not c.brew_managed]
     candidates = search(unmanaged, brew)
     installable = [c for c in candidates if c.installable]
     for res in replace(installable, brew, apply=False):
-        print(
+        _out(
             f"{res.status}\t{res.brew_kind}\t{res.brew_name}\t"
             f"{res.app.name}\t{res.reason}"
         )

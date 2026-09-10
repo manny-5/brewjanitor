@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 from .inventory import App
+from .streams import err as _err
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,7 +101,7 @@ def main() -> int:
 
     out_path = "brewjanitor-unreplaced.csv"
     count = write_report(entries, out_path)
-    print(f"wrote {count} unreplaced app(s) to {out_path}")
+    _err(f"wrote {count} unreplaced app(s) to {out_path}")
     return 0
 
 

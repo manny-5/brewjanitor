@@ -41,6 +41,7 @@ from pathlib import Path
 
 from .brewcheck import Brew
 from .inventory import App
+from .streams import err as _err, out as _out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -220,7 +221,7 @@ def search(
     results: list[AppCandidate] = []
     for index, app in enumerate(apps, start=1):
         if progress:
-            print(f"searching [{index}/{total}] {app.name} ...", file=sys.stderr, flush=True)
+            _err(f"searching [{index}/{total}] {app.name} ...")
         cask_candidates = brew.search_casks(_search_term(app))
         results.append(
             _evaluate(app, cask_candidates, brew, verify=verify and not offline)
@@ -239,12 +240,12 @@ def main() -> int:
 
     brew = Brew()
     if not brew.available:
-        print("brew not found on PATH; nothing is installable.", file=sys.stderr)
+        _err("brew not found on PATH; nothing is installable.")
     unmanaged = [c.app for c in check(inventory(), brew) if not c.brew_managed]
     for cand in search(unmanaged, brew):
         flag = "installable" if cand.installable else "not-installable"
         ver = "verified" if cand.verified else "unverified"
-        print(
+        _out(
             f"{flag}\t{cand.brew_kind}\t{cand.brew_name}\t{ver}\t"
             f"{cand.app.name}\t{cand.app.path}\t{cand.app.bundle_id}"
         )

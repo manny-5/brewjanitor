@@ -6,6 +6,8 @@ redirected at a temporary directory throughout.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import plistlib
 import tempfile
 import unittest
@@ -116,3 +118,60 @@ class TestStatusAndRemove(HomeRedirected):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMalformedPlists(HomeRedirected):
+    """`status` reads a file this tool does not exclusively own.
+
+    It can be hand-edited, written by an older version, or belong to something
+    else entirely. Describing a malformed job is exactly when a readable answer
+    matters most, so it must not raise.
+    """
+
+    def _status_of(self, data):
+        target = autoupdate._plist_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(plistlib.dumps(data))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = autoupdate.status()
+        return code, buf.getvalue()
+
+    def test_a_plist_missing_hour_is_described_not_crashed_on(self):
+        # Regression: `{hour:02d}` with the "?" default raised ValueError.
+        code, out = self._status_of({"Label": "x", "ProgramArguments": ["a"]})
+        self.assertEqual(code, 0)
+        self.assertIn("unknown", out)
+
+    def test_a_non_integer_hour_is_described(self):
+        code, out = self._status_of({"StartCalendarInterval": {"Hour": "8", "Minute": 0}})
+        self.assertEqual(code, 0)
+        self.assertIn("malformed", out)
+
+    def test_an_out_of_range_hour_is_called_out(self):
+        code, out = self._status_of({"StartCalendarInterval": {"Hour": 99, "Minute": 0}})
+        self.assertEqual(code, 0)
+        self.assertIn("out of range", out)
+
+    def test_an_empty_plist_is_survivable(self):
+        code, out = self._status_of({})
+        self.assertEqual(code, 0)
+        self.assertIn("unknown", out)
+
+    def test_non_string_program_arguments_are_coerced(self):
+        # Types a plist can genuinely hold, but that are not strings.
+        code, out = self._status_of({"ProgramArguments": [1, 2.5, "brew"]})
+        self.assertEqual(code, 0)
+        self.assertIn("brew", out)
+
+    def test_a_valid_plist_still_reads_normally(self):
+        code, out = self._status_of(
+            plistlib.loads(autoupdate._build_plist(BREW, 9, 5, False, False))
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("daily at 09:05", out)
+
+    def test_a_non_dict_schedule_does_not_raise(self):
+        self.assertIn("unknown", autoupdate._describe_schedule("not a dict"))
+        self.assertIn("unknown", autoupdate._describe_schedule(None))
+        self.assertIn("unknown", autoupdate._describe_schedule([1, 2]))

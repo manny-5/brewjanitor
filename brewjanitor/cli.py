@@ -20,6 +20,7 @@ from .brewsearch import search
 from .inventory import inventory
 from .replace import replace
 from .report import ReportEntry, write_report
+from .streams import err as _err, out as _out
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -132,19 +133,15 @@ def _note_prerelease_macos(brew: Brew, apply: bool) -> None:
     """
     if brew.prerelease_macos() is not True:
         return
-    print(
+    _err(
         "Note: Homebrew considers this macOS a pre-release and does not support it.\n"
         "      This does not affect brewjanitor: it installs casks, which are\n"
         "      prebuilt apps and OS-independent. (Formulae are built per-OS and\n"
-        "      would be the part affected -- brewjanitor installs none.)",
-        file=sys.stderr,
-    )
+        "      would be the part affected -- brewjanitor installs none.)")
     if apply:
-        print(
+        _err(
             "      brew may print its own pre-release warning during --apply; that is\n"
-            "      expected, and brew's output is shown to you in full.",
-            file=sys.stderr,
-        )
+            "      expected, and brew's output is shown to you in full.")
 
 
 def run(apply: bool, report_path: str | None, offline: bool = False, verbose: bool = False) -> int:
@@ -152,50 +149,43 @@ def run(apply: bool, report_path: str | None, offline: bool = False, verbose: bo
     brew = Brew()
     _note_prerelease_macos(brew, apply)
     if not brew.available:
-        print(
-            "brew not found on PATH; install Homebrew first (https://brew.sh).",
-            file=sys.stderr,
-        )
+        _err(
+            "brew not found on PATH; install Homebrew first (https://brew.sh).")
         # We can still inventory and report; we just won't manage or replace.
-        print("Inventory only (no brew to check against):", file=sys.stderr)
+        _err("Inventory only (no brew to check against):")
 
     apps = inventory()
-    print(f"Found {len(apps)} app(s).", file=sys.stderr)
+    _err(f"Found {len(apps)} app(s).")
 
     checked = check(apps, brew)
     managed = [c for c in checked if c.brew_managed]
     unmanaged_apps = [c.app for c in checked if not c.brew_managed]
-    print(
-        f"Homebrew manages {len(managed)}; {len(unmanaged_apps)} are unmanaged.",
-        file=sys.stderr,
-    )
+    _err(
+        f"Homebrew manages {len(managed)}; {len(unmanaged_apps)} are unmanaged.")
 
     candidates = search(
         unmanaged_apps, brew, offline=offline, verify=apply, progress=verbose
     )
     installable = [c for c in candidates if c.installable]
     not_installable = [c for c in candidates if not c.installable]
-    print(
+    _err(
         f"Of the unmanaged, {len(installable)} could be installed via Homebrew; "
-        f"{len(not_installable)} could not.",
-        file=sys.stderr,
-    )
+        f"{len(not_installable)} could not.")
 
     # Replace step: only installable candidates are acted on. Non-installable
     # ones go to the report instead.
     if apply and brew.available:
-        print("--apply is set: installing and replacing (this changes your system).", file=sys.stderr)
+        _err("--apply is set: installing and replacing (this changes your system).")
     else:
-        print("Dry-run (no --apply): printing the plan only.", file=sys.stderr)
+        _err("Dry-run (no --apply): printing the plan only.")
 
     results = replace(installable, brew, apply=apply)
 
-    print("\nResults:", file=sys.stderr)
+    _err("\nResults:")
     for res in results:
-        print(
+        _out(
             f"  [{res.status}] {res.app.name} "
-            f"({res.brew_kind} {res.brew_name}) -> {res.reason}"
-        )
+            f"({res.brew_kind} {res.brew_name}) -> {res.reason}")
 
     # Report: every unmanaged-not-installable app. A dry-run does NOT write a
     # file (it should not touch the user's working directory); the report is
@@ -213,14 +203,12 @@ def run(apply: bool, report_path: str | None, offline: bool = False, verbose: bo
         ]
         out_path = report_path if report_path is not None else "brewjanitor-unreplaced.csv"
         count = write_report(entries, out_path)
-        print(f"\nWrote {count} unreplaced app(s) to {out_path}", file=sys.stderr)
+        _err(f"\nWrote {count} unreplaced app(s) to {out_path}")
     else:
         if not_installable:
-            print(
+            _err(
                 f"\n{len(not_installable)} app(s) could not be replaced; re-run with "
-                "--report PATH.csv (or --apply) to write the list to a file.",
-                file=sys.stderr,
-            )
+                "--report PATH.csv (or --apply) to write the list to a file.")
 
     # Exit non-zero if any apply step failed, so scripts/CIs can detect it.
     if apply and any(r.status == "failed" for r in results):
@@ -239,27 +227,24 @@ def _run_reconcile(apply: bool, verbose: bool) -> int:
 
     brew = Brew()
     if not brew.available:
-        print("brew not found on PATH; cannot reconcile.", file=sys.stderr)
+        _err("brew not found on PATH; cannot reconcile.")
         return 1
     apps = inventory()
-    print(f"Checking {len(apps)} app(s) for leftover old bundles ...", file=sys.stderr)
+    _err(f"Checking {len(apps)} app(s) for leftover old bundles ...")
     results = reconcile(apps, brew, apply=apply)
-    print("\nReconcile results:", file=sys.stderr)
+    _err("\nReconcile results:")
     for res in results:
         if res.status == "skipped":
             continue
-        print(
+        _out(
             f"  [{res.status}] {res.app.name} "
-            f"({res.brew_kind} {res.brew_name}) -> {res.reason}"
-        )
+            f"({res.brew_kind} {res.brew_name}) -> {res.reason}")
     leftovers = [r for r in results if r.status in ("dry-run", "replaced", "failed")]
     if not leftovers:
-        print("No leftover old bundles found; nothing to clean up.", file=sys.stderr)
+        _err("No leftover old bundles found; nothing to clean up.")
     elif not apply:
-        print(
-            f"\n{len(leftovers)} leftover bundle(s) found. Re-run with --apply to remove them.",
-            file=sys.stderr,
-        )
+        _err(
+            f"\n{len(leftovers)} leftover bundle(s) found. Re-run with --apply to remove them.")
     return 0
 
 
@@ -273,10 +258,10 @@ def _run_autoupdate(args: argparse.Namespace) -> int:
         return _au.status()
     if args.install:
         if not 0 <= args.hour <= 23:
-            print("--hour must be 0-23", file=sys.stderr)
+            _err("--hour must be 0-23")
             return 1
         if not 0 <= args.minute <= 59:
-            print("--minute must be 0-59", file=sys.stderr)
+            _err("--minute must be 0-59")
             return 1
         return _au.install(args.hour, args.minute, args.greedy, args.cleanup)
     # No action given: print the autoupdate help.

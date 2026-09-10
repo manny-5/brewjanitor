@@ -46,6 +46,7 @@ import sys
 from pathlib import Path
 
 from .brewcheck import Brew
+from .streams import err as _err, out as _out
 
 # Where tools land when installed by hand -- a package's own installer, a
 # `make install`, a curl-to-bash script. Deliberately NOT the whole PATH: a
@@ -242,7 +243,7 @@ def survey(
             continue
         index += 1
         if progress:
-            print(f"checking [{index}/{total}] {b.name} ...", file=sys.stderr, flush=True)
+            _err(f"checking [{index}/{total}] {b.name} ...")
         formula = ""
         if brew.available:
             for name in brew.search_formulae(b.name):
@@ -293,7 +294,7 @@ def report(
     """
     brew = brew if brew is not None else Brew()
     if not brew.available:
-        print("brew not found on PATH; cannot check formulae.", file=sys.stderr)
+        _err("brew not found on PATH; cannot check formulae.")
         return 1
 
     found, collapsed = binaries(directories, brew.prefix(), all_path)
@@ -306,53 +307,45 @@ def report(
     scanned = list(directories) if directories else (
         _path_dirs() if all_path else list(DEFAULT_BIN_DIRS)
     )
-    print(f"Scanned {len(scanned)} location(s) for command-line tools.", file=sys.stderr)
+    _err(f"Scanned {len(scanned)} location(s) for command-line tools.")
 
     if available:
-        print(
-            f"\n{len(available)} tool(s) Homebrew has a formula for:",
-            file=sys.stderr,
-        )
+        _err(
+            f"\n{len(available)} tool(s) Homebrew has a formula for:")
         for c in available:
-            print(f"  {c.binary.name}  ({c.binary.path})  ->  brew formula `{c.formula}`")
-        print(
+            _out(f"  {c.binary.name}  ({c.binary.path})  ->  brew formula `{c.formula}`")
+        _err(
             "\nThis is a report only. brewjanitor will not install or remove "
             "command-line tools:\nHomebrew installs into its own prefix, so a "
             "'replacement' would leave both\ncopies on disk with PATH order "
             "deciding which one runs. Review each one and\ninstall it yourself "
-            "if you want it managed:",
-            file=sys.stderr,
-        )
+            "if you want it managed:")
         for c in available:
-            print(f"    brew install {c.formula}", file=sys.stderr)
+            _err(f"    brew install {c.formula}")
     else:
-        print("\nNo manually installed tools have a matching Homebrew formula.", file=sys.stderr)
+        _err("\nNo manually installed tools have a matching Homebrew formula.")
 
     if unmatched:
-        print(
+        _err(
             f"\n{len(unmatched)} tool(s) with no matching formula: "
-            + ", ".join(sorted(c.binary.name for c in unmatched)),
-            file=sys.stderr,
-        )
+            + ", ".join(sorted(c.binary.name for c in unmatched)))
 
     if skipped:
         reasons: dict[str, int] = {}
         for c in skipped:
             reasons[c.binary.skip_reason] = reasons.get(c.binary.skip_reason, 0) + 1
-        print("\nAlready accounted for:", file=sys.stderr)
+        _err("\nAlready accounted for:")
         for reason, count in sorted(reasons.items()):
-            print(f"  {count:4d}  {reason}", file=sys.stderr)
+            _err(f"  {count:4d}  {reason}")
 
     for directory, count in collapsed:
-        print(
+        _err(
             f"\nSkipped {directory}: {count} executables, which looks like one "
-            "self-contained\n  product rather than that many separate tools.",
-            file=sys.stderr,
-        )
+            "self-contained\n  product rather than that many separate tools.")
 
     if report_path is not None:
         count = write_report(candidates, report_path)
-        print(f"\nWrote {count} row(s) to {report_path}", file=sys.stderr)
+        _err(f"\nWrote {count} row(s) to {report_path}")
 
     return 0
 
