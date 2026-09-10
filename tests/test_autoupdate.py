@@ -175,3 +175,55 @@ class TestMalformedPlists(HomeRedirected):
         self.assertIn("unknown", autoupdate._describe_schedule("not a dict"))
         self.assertIn("unknown", autoupdate._describe_schedule(None))
         self.assertIn("unknown", autoupdate._describe_schedule([1, 2]))
+
+
+class TestCommandLineIsSharedWithThePlist(HomeRedirected):
+    """What `--install` prints must be what the job actually runs."""
+
+    def _plist_command(self, greedy=False, cleanup=False):
+        p = plistlib.loads(autoupdate._build_plist(BREW, 8, 0, greedy, cleanup))
+        return p["ProgramArguments"][-1]
+
+    def test_the_plist_uses_the_shared_builder(self):
+        for greedy, cleanup in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(greedy=greedy, cleanup=cleanup):
+                self.assertEqual(
+                    self._plist_command(greedy, cleanup),
+                    autoupdate._command_line(BREW, greedy, cleanup),
+                )
+
+    def test_greedy_attaches_to_upgrade_not_cleanup(self):
+        self.assertEqual(
+            autoupdate._command_line(BREW, greedy=True, cleanup=True),
+            f"{BREW} update && {BREW} upgrade --greedy && {BREW} cleanup",
+        )
+
+    def test_install_prints_exactly_the_command_it_scheduled(self):
+        # Regression risk: the printed line used to be reconstructed by hand
+        # alongside the plist, so the two could drift apart silently.
+        buf = io.StringIO()
+        with mock.patch.object(autoupdate, "_resolve_brew", return_value=BREW), \
+             mock.patch.object(autoupdate, "unload", return_value=0), \
+             mock.patch("subprocess.run",
+                        return_value=__import__("subprocess").CompletedProcess([], 0, "", "")), \
+             contextlib.redirect_stdout(buf):
+            self.assertEqual(autoupdate.install(7, 30, True, True), 0)
+        printed = buf.getvalue()
+        self.assertIn(autoupdate._command_line(BREW, True, True), printed)
+        self.assertIn("at 07:30 every day.", printed)
+        written = plistlib.loads(autoupdate._plist_path().read_bytes())
+        self.assertIn(written["ProgramArguments"][-1], printed)
+
+
+class TestAutoupdateUsesOrderedStreams(unittest.TestCase):
+    def test_the_module_has_no_raw_print(self):
+        # autoupdate writes to BOTH streams (status to stdout, errors to
+        # stderr), so it has the same interleaving problem as the scan.
+        import ast
+        tree = ast.parse(Path(autoupdate.__file__).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                self.assertNotEqual(
+                    node.func.id, "print",
+                    "autoupdate must write through streams.out/err, not print()",
+                )

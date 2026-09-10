@@ -12,6 +12,7 @@ import subprocess
 import sys
 import textwrap
 import unittest
+from pathlib import Path
 
 
 PROGRAM = textwrap.dedent(
@@ -136,3 +137,78 @@ class TestOrderingAgainstBarePrints(unittest.TestCase):
             _merged(MIXED_PROGRAM.format(root=self.root)),
             ["bare print to stdout", "then a stderr line", "bare print again"],
         )
+
+
+PARTIAL_STDERR = textwrap.dedent(
+    """
+    import sys
+    sys.path.insert(0, {root!r})
+    from brewjanitor.streams import out
+    # A partial line (no newline) sits in stderr's buffer. Anything that is not
+    # our own helpers can leave one there: a library, warnings, a progress
+    # indicator. out() has to flush stderr before writing, or its line jumps
+    # ahead of text that was produced first.
+    sys.stderr.write("first: partial progress")
+    out("second: a result")
+    sys.stderr.write("\\n")
+    """
+)
+
+
+class TestOutFlushesStderrFirst(unittest.TestCase):
+    """Isolates out()'s leading stderr flush.
+
+    err() already flushes stderr on the way out, so back-to-back helper calls
+    would stay ordered without it. The flush earns its place only when stderr
+    holds text that something else left unflushed -- which is exactly when
+    getting it wrong is hardest to debug.
+    """
+
+    def setUp(self):
+        import pathlib
+        self.root = str(pathlib.Path(__file__).resolve().parent.parent)
+
+    def test_unflushed_stderr_text_still_comes_out_first(self):
+        # Compared by position in the raw byte stream, not by line: the partial
+        # write has no newline, so correct ordering puts the two on one line.
+        proc = subprocess.run(
+            [sys.executable, "-c", PARTIAL_STDERR.format(root=self.root)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        raw = proc.stdout
+        self.assertIn("first: partial progress", raw)
+        self.assertIn("second: a result", raw)
+        self.assertLess(
+            raw.index("first: partial progress"), raw.index("second: a result"),
+            f"stdout jumped ahead of unflushed stderr text: {raw!r}",
+        )
+
+
+class TestWholePackageUsesOrderedStreams(unittest.TestCase):
+    """Item 3 is only fixed if nothing bypasses the helpers.
+
+    One stray `print()` in a module that also writes to the other stream is
+    enough to bring the scrambling back, and it would not show up in any
+    behavioural test that captures only one stream.
+    """
+
+    def _package_modules(self):
+        pkg = Path(__import__("brewjanitor").__file__).parent
+        return [p for p in sorted(pkg.glob("*.py")) if p.name != "streams.py"]
+
+    def test_no_module_calls_print_directly(self):
+        import ast
+        offenders = []
+        for path in self._package_modules():
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                        and node.func.id == "print":
+                    offenders.append(f"{path.name}:{node.lineno}")
+        self.assertEqual(offenders, [], f"raw print() found at: {offenders}")
+
+    def test_modules_that_produce_output_import_the_helpers(self):
+        for path in self._package_modules():
+            src = path.read_text()
+            if "_out(" in src or "_err(" in src:
+                self.assertIn("from .streams import", src, f"{path.name}")
