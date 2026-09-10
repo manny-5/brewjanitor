@@ -13,7 +13,7 @@ import subprocess
 
 
 def cask_info(token, bundle_id="", apps=(), appdir=None):
-    """Build a `brew info --json=v2` payload for a single cask.
+    """Build a `brew info --json=v2` payload for a single app cask.
 
     Mirrors the real shape: casks[].artifacts[].app[] holds bundle *install
     names* ("Firefox.app"), not absolute paths, which is exactly the detail the
@@ -28,6 +28,37 @@ def cask_info(token, bundle_id="", apps=(), appdir=None):
                 "token": token,
                 "full_name": token,
                 "bundle_identifier": bundle_id,
+                "artifacts": artifacts,
+            }
+        ],
+        "formulae": [],
+    }
+
+
+def cask_info_pkg(token, bundle_ids=(), pkg="Installer.pkg", uninstall=None, zap=None):
+    """Build a `brew info --json=v2` payload for a single pkg cask.
+
+    Mirrors the real shape for a cask that ships a .pkg installer instead of an
+    .app bundle (Malwarebytes, the Microsoft Office suite, NordVPN). Such a
+    cask has NO `artifacts[].app[]` entry -- so the ownership/verify code cannot
+    look for a .app path -- and typically an empty `bundle_identifier`. The
+    app's identity lives in the uninstall/zap directives: `quit` (a bundle id
+    or list of them), `login_item`, `pkgutil`, and `trash` (paths whose leaf
+    is a bundle id). `bundle_ids` is the convenience list the test author means
+    to expose via `quit`; pass a richer `uninstall`/`zap` for cases that need
+    the other directives.
+    """
+    if uninstall is None:
+        uninstall = [{"quit": list(bundle_ids)}]
+    artifacts = [{"pkg": pkg}, {"uninstall": uninstall}]
+    if zap is not None:
+        artifacts.append({"zap": zap})
+    return {
+        "casks": [
+            {
+                "token": token,
+                "full_name": token,
+                "bundle_identifier": "",
                 "artifacts": artifacts,
             }
         ],

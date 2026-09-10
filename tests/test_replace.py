@@ -82,16 +82,24 @@ class TestSafeToRemove(unittest.TestCase):
         # rejected everything under a symlinked ancestor the two share. On
         # macOS that is every path under /var (a symlink to /private/var), so
         # reconcile silently refused to clean up real leftovers.
+        #
+        # We build our own symlinked ancestor rather than relying on the OS to
+        # have one (Linux's /tmp is not symlinked, so the old assertion that
+        # abspath != realpath aborted the test as "not meaningful" there).
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "Applications"
-            root.mkdir(parents=True)
-            bundle = root / "Firefox.app"
+            real_root = Path(tmp) / "real" / "Applications"
+            real_root.mkdir(parents=True)
+            link_root = Path(tmp) / "link" / "Applications"
+            link_root.parent.mkdir(parents=True)
+            link_root.symlink_to(real_root)
+            bundle = real_root / "Firefox.app"
             (bundle / "Contents").mkdir(parents=True)
+            bundle_via_link = link_root / "Firefox.app"
             self.assertNotEqual(
-                os.path.abspath(str(bundle)), os.path.realpath(str(bundle)),
+                os.path.abspath(str(bundle_via_link)), os.path.realpath(str(bundle_via_link)),
                 "test needs a symlinked ancestor to be meaningful",
             )
-            self.assertTrue(_is_safe_to_remove(str(bundle), (str(root),)))
+            self.assertTrue(_is_safe_to_remove(str(bundle_via_link), (str(link_root),)))
 
     def test_a_symlink_escaping_the_root_is_still_refused(self):
         # The security property the two-form check exists for: a bundle inside
@@ -270,6 +278,72 @@ class TestReplaceApply(unittest.TestCase):
         self.assertIn("permission denied", results[0].reason)
 
 
+class TestReplaceApplyPkgCask(unittest.TestCase):
+    """A pkg cask (Malwarebytes, Microsoft Office, NordVPN) ships a .pkg, not an
+    .app. brew reports no owned .app path for it, so verify matches on the
+    bundle ids in its uninstall/zap directives, and the in-place decision must
+    treat the empty owned-path list as "nothing separate to remove" rather than
+    as a leftover to delete.
+    """
+
+    def _brew(self, brew_name="microsoft-excel", bundle_id="com.microsoft.Excel", install_result=None):
+        from tests.fakes import cask_info_pkg
+        return FakeBrew(
+            info_by_name={brew_name: cask_info_pkg(brew_name, [bundle_id])},
+            install_result=install_result or ok(),
+        )
+
+    def _candidate(self, brew_name="microsoft-excel", bundle_id="com.microsoft.Excel", where="/Applications"):
+        a = app(name="Microsoft Excel.app", bundle_id=bundle_id, where=where)
+        return candidate(a=a, installable=True, brew_name=brew_name, kind="cask", verified=True)
+
+    def test_a_pkg_cask_in_place_removes_nothing(self):
+        # The original .app in /Applications IS the brew-managed copy (a pkg
+        # installer lands there), so there is nothing to delete. An empty
+        # owned-path list must NOT fall through to removal for a pkg cask.
+        brew, remover = self._brew(), RecordingRemover()
+        results = replace([self._candidate()], brew, apply=True, allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "replaced")
+        self.assertIn("adopted in place", results[0].reason)
+        self.assertEqual(remover.calls, [])
+
+    def test_a_pkg_cask_install_requests_adoption(self):
+        brew = self._brew()
+        replace([self._candidate()], brew, apply=True, allowed_roots=ROOTS, remover=RecordingRemover())
+        self.assertEqual(brew.install_calls, [("microsoft-excel", True, True)])
+
+    def test_a_pkg_cask_verify_failure_removes_nothing(self):
+        # The cask's uninstall directives do not name this app's bundle id, so
+        # verify fails closed -- the original is left untouched.
+        from tests.fakes import cask_info_pkg
+        brew = FakeBrew(
+            info_by_name={"microsoft-excel": cask_info_pkg("microsoft-excel", ["com.microsoft.Excel"])},
+            install_result=ok(),
+        )
+        remover = RecordingRemover()
+        cand = self._candidate(bundle_id="com.totally.different")
+        results = replace([cand], brew, apply=True, allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "failed")
+        self.assertIn("verify failed", results[0].reason)
+        self.assertEqual(remover.calls, [])
+
+    def test_a_pkg_cask_install_failure_removes_nothing(self):
+        brew, remover = self._brew(install_result=fail("network is down")), RecordingRemover()
+        results = replace([self._candidate()], brew, apply=True, allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "failed")
+        self.assertEqual(remover.calls, [])
+
+    def test_a_pkg_cask_without_an_app_bundle_id_fails_verification(self):
+        # The app has no CFBundleIdentifier, so there is nothing to match a pkg
+        # cask's identity against. Fail closed; never delete.
+        brew, remover = self._brew(), RecordingRemover()
+        cand = self._candidate(bundle_id="")
+        results = replace([cand], brew, apply=True, allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "failed")
+        self.assertIn("verify failed", results[0].reason)
+        self.assertEqual(remover.calls, [])
+
+
 class TestInstallFailureReason(unittest.TestCase):
     def test_adopt_version_mismatch_gets_an_actionable_message(self):
         reason = _install_failure_reason(
@@ -348,6 +422,56 @@ class TestReconcile(unittest.TestCase):
         results = reconcile([app()], FakeBrew(available=False), apply=True,
                             allowed_roots=ROOTS, remover=remover)
         self.assertEqual(results[0].status, "skipped")
+        self.assertEqual(remover.calls, [])
+
+
+class TestReconcilePkgCask(unittest.TestCase):
+    """reconcile must detect orphans from pkg cask installs too. A pkg cask has
+    an empty bundle_identifier, so its identity lives in the uninstall/zap
+    directives; reconcile's bundle-id index must draw from those, not just from
+    bundle_identifier.
+    """
+
+    def _brew(self, token="microsoft-excel", bundle_id="com.microsoft.Excel"):
+        from tests.fakes import cask_info_pkg
+        return FakeBrew(installed_casks=cask_info_pkg(token, [bundle_id])["casks"])
+
+    def test_a_leftover_with_a_matching_pkg_cask_bundle_id_is_an_orphan(self):
+        leftover = app(name="Microsoft Excel.app", bundle_id="com.microsoft.Excel",
+                       where="/Users/tester/Applications")
+        remover = RecordingRemover()
+        results = reconcile([leftover], self._brew(), apply=True,
+                            allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "replaced")
+        self.assertEqual(remover.calls, [leftover.path])
+
+    def test_a_pkg_cask_orphan_with_a_mismatched_bundle_id_is_not_removed(self):
+        # The leftover's bundle id is not among the cask's identities, so it is
+        # not an orphan -- do not delete it.
+        leftover = app(name="Microsoft Excel.app", bundle_id="com.totally.different",
+                       where="/Users/tester/Applications")
+        remover = RecordingRemover()
+        results = reconcile([leftover], self._brew(), apply=True,
+                            allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "skipped")
+        self.assertEqual(remover.calls, [])
+
+    def test_a_pkg_cask_orphan_outside_the_allowed_roots_is_refused(self):
+        stray = app(name="Microsoft Excel.app", bundle_id="com.microsoft.Excel",
+                    where="/Users/tester/Desktop")
+        remover = RecordingRemover()
+        results = reconcile([stray], self._brew(), apply=True,
+                            allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "failed")
+        self.assertEqual(remover.calls, [])
+
+    def test_a_pkg_cask_orphan_is_reported_in_dry_run_without_removing(self):
+        leftover = app(name="Microsoft Excel.app", bundle_id="com.microsoft.Excel",
+                       where="/Users/tester/Applications")
+        remover = RecordingRemover()
+        results = reconcile([leftover], self._brew(), apply=False,
+                            allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "dry-run")
         self.assertEqual(remover.calls, [])
 
 
