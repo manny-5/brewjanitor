@@ -235,6 +235,11 @@ brewjanitor is built in stages, each safe to run on its own:
    design: it never installs and never deletes. Read-only.
 8. **Streams** (`streams.py`) — ordered writes to stdout and stderr. Results go
    to stdout so `brewjanitor | grep ...` works; progress and summaries go to
+   stderr so they stay out of that pipe. The two streams buffer differently, so
+   every write flushes the other stream first — otherwise, when both land in
+   the same place, the summary lines arrive above the results they summarise.
+8. **Streams** (`streams.py`) — ordered writes to stdout and stderr. Results go
+   to stdout so `brewjanitor | grep ...` works; progress and summaries go to
    stderr. The two buffer differently, so each write flushes the other stream
    first — otherwise, whenever both land in the same terminal or file, the
    lines arrive out of order (a summary once printed *above* the results it
