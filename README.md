@@ -100,6 +100,19 @@ One limitation worth knowing: Homebrew will only adopt a bundle whose version
 matches the cask's current version. If yours is out of date, the adopt fails
 with a message telling you to update the app first, and nothing is changed.
 
+### `pkg` casks (Microsoft Office, Malwarebytes, NordVPN, …)
+
+Some casks ship a `.pkg` installer instead of a `.app` bundle (Microsoft Word,
+Excel, PowerPoint, OneNote, Teams, Malwarebytes, NordVPN). For those, brew
+reports **no owned `.app` path**, so the verify step matches on the **bundle
+ids the cask names in its `uninstall`/`zap` directives** (e.g.
+`com.microsoft.Excel`, `com.nordvpn.macos`) against your app's
+`CFBundleIdentifier` — not on an `.app` filename. Because a pkg installer
+does not report a single install path, brewjanitor treats a verified pkg-cask
+install as **in place** and removes nothing (deleting the original would risk
+removing brew's own copy). The same bundle-id matching lets `--reconcile`
+detect a leftover old bundle from a pkg-cask install.
+
 > ⚠️ `--apply` changes your system (it runs `brew install`, and in the leftover
 > case deletes an old `.app` bundle). Read the dry-run output first.
 
@@ -237,12 +250,6 @@ brewjanitor is built in stages, each safe to run on its own:
    stderr so they stay out of that pipe. The two streams buffer differently, so
    every write flushes the other stream first — otherwise, when both land in
    the same place, the summary lines arrive above the results they summarise.
-8. **Streams** (`streams.py`) — ordered writes to stdout and stderr. Results go
-   to stdout so `brewjanitor | grep ...` works; progress and summaries go to
-   stderr. The two buffer differently, so each write flushes the other stream
-   first — otherwise, whenever both land in the same terminal or file, the
-   lines arrive out of order (a summary once printed *above* the results it
-   summarised).
 
 You can also run any piece directly, e.g.:
 

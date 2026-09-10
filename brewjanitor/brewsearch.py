@@ -104,6 +104,87 @@ def _cask_app_artifacts(info: dict) -> list[tuple[str, str]]:
     return out
 
 
+def _cask_is_pkg(cask: dict) -> bool:
+    """True if a cask installs via a .pkg rather than dropping an .app.
+
+    A pkg cask (Malwarebytes, the Microsoft Office suite, NordVPN) has an
+    `artifacts[].pkg` entry and NO `artifacts[].app[]`. That matters for two
+    reasons: the verify step cannot look for a matching .app artifact (there
+    is none), and the install does not land at a single path brew can report
+    owning (a pkg installer scatters files across /Applications, /Library, a
+    few LaunchAgents). Detection lets the verifier fall back to the bundle ids
+    the cask itself records in its uninstall/zap directives.
+    """
+    for artifact in cask.get("artifacts", []) or []:
+        if isinstance(artifact, dict) and "pkg" in artifact:
+            return True
+    return False
+
+
+def _cask_bundle_ids(cask: dict) -> list[str]:
+    """Every bundle identifier a cask associates with itself.
+
+    For an `app` cask this is `bundle_identifier` (a single id shared by all
+    app artifacts). For a `pkg` cask `bundle_identifier` is typically empty --
+    the installer's payload declares the id, not the cask DSL -- so we also
+    collect the ids the cask names in its `uninstall` and `zap` directives.
+    Those are the identities brew itself uses to stop/quit/uninstall the app,
+    so they are exactly the set a verifier can match an existing .app's
+    CFBundleIdentifier against.
+
+    Sources, in order:
+      * cask['bundle_identifier']            (the app-cask primary id)
+      * uninstall[*]['quit']                 (string or list)
+      * uninstall[*]['login_item']           (a bundle id, despite the name)
+      * zap[*]['trash']                      (paths containing the id)
+      * uninstall[*]['pkgutil']              (bundle ids appear in pkg ids too)
+    """
+    ids: list[str] = []
+    bid = cask.get("bundle_identifier", "") or ""
+    if isinstance(bid, str) and bid:
+        ids.append(bid)
+
+    def _add(value: object) -> None:
+        if isinstance(value, str) and value:
+            ids.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item:
+                    ids.append(item)
+
+    for artifact in cask.get("artifacts", []) or []:
+        if not isinstance(artifact, dict):
+            continue
+        for directive in (artifact.get("uninstall"), artifact.get("zap")):
+            if not isinstance(directive, list):
+                continue
+            for entry in directive:
+                if not isinstance(entry, dict):
+                    continue
+                _add(entry.get("quit"))
+                _add(entry.get("login_item"))
+                _add(entry.get("pkgutil"))
+                # trash entries are paths (~/Library/.../com.microsoft.Excel);
+                # the trailing path component is the bundle id, when it looks
+                # like a reverse-dns id rather than a file name with an extension.
+                trash = entry.get("trash")
+                trash_items = trash if isinstance(trash, list) else [trash]
+                for path in trash_items:
+                    if not isinstance(path, str) or not path:
+                        continue
+                    leaf = path.rstrip("/").rsplit("/", 1)[-1]
+                    if leaf and "." in leaf and "." not in leaf.split(".", 1)[0] and "." in leaf:
+                        ids.append(leaf)
+    # de-duplicate, preserve order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for bid in ids:
+        if bid not in seen:
+            seen.add(bid)
+            unique.append(bid)
+    return unique
+
+
 def _app_name_lower(app: App) -> str:
     """Lowercased, hyphenated bundle name without .app, mirroring cask naming."""
     name = _TERM_SUFFIX.sub("", app.name)
@@ -137,16 +218,46 @@ def _verify_cask(app: App, brew: Brew, name: str) -> bool:
     This is the (slow, network) verification step: `brew info --json=v2 <name>`.
     It is only called when a caller needs the `verified` flag -- i.e. right
     before an actual install under --apply. A dry run never needs it.
+
+    For an `app` cask the match is on .app path or bundle id. For a `pkg` cask
+    there is no .app artifact to match a path against, so the match is on
+    bundle id only -- the bundle ids the cask names in its uninstall/zap
+    directives, which are the identities brew itself uses to manage the app.
     """
     info = brew.info_json_any(name)
     if not info or not info.get("casks"):
         return False
-    for app_path, bid in _cask_app_artifacts(info):
-        if app.bundle_id and bid and bid == app.bundle_id:
-            return True
-        if Path(app_path).name.lower() == app.name.lower():
-            return True
+    for cask in info.get("casks", []):
+        if _cask_is_pkg(cask):
+            for bid in _cask_bundle_ids(cask):
+                if app.bundle_id and bid == app.bundle_id:
+                    return True
+            continue
+        for app_path, bid in _cask_app_artifacts_single(cask):
+            if app.bundle_id and bid and bid == app.bundle_id:
+                return True
+            if Path(app_path).name.lower() == app.name.lower():
+                return True
     return False
+
+
+def _cask_app_artifacts_single(cask: dict) -> list[tuple[str, str]]:
+    """Like _cask_app_artifacts but for a single cask dict, not the whole info."""
+    bid = cask.get("bundle_identifier", "") or ""
+    if not isinstance(bid, str):
+        bid = ""
+    out: list[tuple[str, str]] = []
+    for artifact in cask.get("artifacts", []) or []:
+        if isinstance(artifact, dict):
+            apps = artifact.get("app", [])
+        elif isinstance(artifact, list):
+            apps = artifact
+        else:
+            apps = []
+        for item in apps:
+            if isinstance(item, str) and item.endswith(".app"):
+                out.append((item, bid))
+    return out
 
 
 def _evaluate(

@@ -166,12 +166,22 @@ def reconcile(
 
     by_path, _, _ = _build_brew_ownership(brew)
 
-    # Map bundle_id -> brew_name for every installed cask that reports one.
+    # Map bundle_id -> brew_name for every installed cask, covering BOTH cask
+    # shapes. An `app` cask reports its single id in `bundle_identifier`; a
+    # `pkg` cask (Malwarebytes, Microsoft Office, NordVPN) has an empty
+    # `bundle_identifier` and instead names its bundle ids in the uninstall/zap
+    # directives (quit, login_item, pkgutil, trash). `_cask_bundle_ids`
+    # collects both, so a leftover from a pkg cask install is detectable here
+    # the same way an app cask leftover is -- by the bundle id brew itself uses
+    # to manage the app.
+    from .brewsearch import _cask_bundle_ids
+
     by_bundle_id: dict[str, str] = {}
     for cask in brew.info_installed_all(is_cask=True):
         token = cask.get("token") or cask.get("full_name") or cask.get("name") or ""
-        bid = cask.get("bundle_identifier", "") or ""
-        if isinstance(token, str) and isinstance(bid, str) and bid:
+        if not isinstance(token, str) or not token:
+            continue
+        for bid in _cask_bundle_ids(cask):
             by_bundle_id.setdefault(bid, token)
 
     for a in apps:
@@ -264,7 +274,7 @@ def _owned_app_paths(info: dict) -> list[str]:
 
 def _verify_install(
     app: App, brew: Brew, brew_name: str, is_cask: bool
-) -> tuple[bool, str, list[str]]:
+) -> tuple[bool, str, list[str], bool]:
     """Check that the brew install actually placed the expected app.
 
     We re-read `brew info --json=v2 --installed <name>` and look for an installed
@@ -272,32 +282,54 @@ def _verify_install(
     filename matches the original. A match means brew now owns an equivalent
     app.
 
-    Returns (ok, reason, owned_paths) -- owned_paths lets the caller decide
-    whether the original bundle IS the adopted one (nothing to remove) or a
-    separate leftover copy.
+    Returns (ok, reason, owned_paths, is_pkg_cask) -- owned_paths lets the caller
+    decide whether the original bundle IS the adopted one (nothing to remove) or
+    a separate leftover copy. For a pkg cask, owned_paths is empty (a pkg
+    installer does not report a single owned .app path); is_pkg_cask tells the
+    caller to treat an empty owned list as "in place, nothing to remove" rather
+    than as a leftover to delete.
     """
     if not app.bundle_id and not app.name:
-        return False, "no bundle id or name to verify against", []
+        return False, "no bundle id or name to verify against", [], False
     info = brew.info_json(brew_name, is_cask=is_cask)
     if not info:
-        return False, f"brew info returned nothing for {brew_name}", []
+        return False, f"brew info returned nothing for {brew_name}", [], False
 
     if not is_cask:
         # Apps come from casks, not formulae. brewsearch no longer proposes
         # formula candidates at all, but this stays as a backstop: we cannot
         # confirm a formula placed a matching .app, and no verified match means
         # no delete.
-        return False, "formula installs are not auto-replaced (apps come from casks)", []
+        return False, "formula installs are not auto-replaced (apps come from casks)", [], False
 
-    from .brewsearch import _cask_app_artifacts
+    from .brewsearch import _cask_app_artifacts, _cask_bundle_ids, _cask_is_pkg
 
+    casks = info.get("casks", []) or []
     owned = _owned_app_paths(info)
+    pkg_cask = any(_cask_is_pkg(c) for c in casks)
+
+    # A pkg cask has no .app artifact to match a path against. It installs via a
+    # .pkg installer that scatters files (the .app, LaunchAgents, helpers), so
+    # the only identity it reports is the set of bundle ids in its uninstall/zap
+    # directives. Verify on bundle id alone; if the app has no bundle id there
+    # is nothing to match and we fail closed (no delete). owned_paths is empty
+    # for a pkg cask, and is_pkg_cask=True tells the caller that emptiness means
+    # "no separate copy detected" rather than "remove the original".
+    if pkg_cask:
+        if not app.bundle_id:
+            return False, "pkg cask but the original app has no bundle id to verify against", owned, True
+        for cask in casks:
+            for bid in _cask_bundle_ids(cask):
+                if bid == app.bundle_id:
+                    return True, f"pkg cask bundle id matches: {bid}", owned, True
+        return False, "pkg cask uninstall/zap directives did not name this app's bundle id", owned, True
+
     for art_path, bid in _cask_app_artifacts(info):
         if app.bundle_id and bid and bid == app.bundle_id:
-            return True, f"bundle id matches: {bid}", owned
+            return True, f"bundle id matches: {bid}", owned, False
         if Path(art_path).name.lower() == app.name.lower():
-            return True, f"app path matches: {art_path}", owned
-    return False, "installed artifact did not match original app", owned
+            return True, f"app path matches: {art_path}", owned, False
+    return False, "installed artifact did not match original app", owned, False
 
 
 def _install_failure_reason(stderr: str) -> str:
@@ -408,7 +440,9 @@ def replace(
             )
             continue
 
-        ok, why, owned = _verify_install(cand.app, brew, cand.brew_name, is_cask=is_cask)
+        ok, why, owned, is_pkg = _verify_install(
+            cand.app, brew, cand.brew_name, is_cask=is_cask
+        )
         if not ok:
             results.append(
                 ReplaceResult(
@@ -424,7 +458,16 @@ def replace(
         # Adopted in place: brew now owns the very bundle we started from, so
         # there is nothing left to delete. This is the common, and by far the
         # safest, outcome -- the whole rmtree path below is skipped.
-        if _normalize_path(cand.app.path) in owned:
+        #
+        # A pkg cask reports no owned .app paths (its installer does not land at
+        # a single path brew records), so `owned` is empty and a naive check
+        # would fall through to removal. It must not: a pkg install typically
+        # placed the .app exactly where the original already sat, so removing
+        # the original would delete brew's own copy. The verify step already
+        # confirmed brew now manages an app of this bundle id; without a path to
+        # tell the two apart, the only safe assumption is in place. So an empty
+        # `owned` for a verified pkg cask means "no separate copy detected".
+        if _normalize_path(cand.app.path) in owned or (is_pkg and not owned):
             results.append(
                 ReplaceResult(
                     app=cand.app,
