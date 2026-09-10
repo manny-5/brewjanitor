@@ -77,6 +77,51 @@ class TestSafeToRemove(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse(_is_safe_to_remove(path, ROOTS))
 
+    def test_a_symlinked_ancestor_does_not_cause_a_false_refusal(self):
+        # Regression: comparing the literal path against the *resolved* root
+        # rejected everything under a symlinked ancestor the two share. On
+        # macOS that is every path under /var (a symlink to /private/var), so
+        # reconcile silently refused to clean up real leftovers.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Applications"
+            root.mkdir(parents=True)
+            bundle = root / "Firefox.app"
+            (bundle / "Contents").mkdir(parents=True)
+            self.assertNotEqual(
+                os.path.abspath(str(bundle)), os.path.realpath(str(bundle)),
+                "test needs a symlinked ancestor to be meaningful",
+            )
+            self.assertTrue(_is_safe_to_remove(str(bundle), (str(root),)))
+
+    def test_a_symlink_escaping_the_root_is_still_refused(self):
+        # The security property the two-form check exists for: a bundle inside
+        # a root that POINTS outside it must not be approved.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Applications"
+            root.mkdir(parents=True)
+            outside = Path(tmp) / "Elsewhere"
+            outside.mkdir()
+            target = outside / "Real.app"
+            (target / "Contents").mkdir(parents=True)
+            link = root / "Escape.app"
+            link.symlink_to(target)
+            self.assertFalse(_is_safe_to_remove(str(link), (str(root),)))
+
+    def test_a_path_outside_the_roots_that_points_inside_is_refused(self):
+        # Isolates the literal-form check. Judging on the resolved form alone
+        # would approve a path we were never asked to manage, purely because
+        # of where it happens to point.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Applications"
+            root.mkdir(parents=True)
+            real = root / "Real.app"
+            (real / "Contents").mkdir(parents=True)
+            elsewhere = Path(tmp) / "Elsewhere"
+            elsewhere.mkdir()
+            pointer = elsewhere / "Pointer.app"
+            pointer.symlink_to(real)
+            self.assertFalse(_is_safe_to_remove(str(pointer), (str(root),)))
+
     def test_empty_root_list_refuses_everything(self):
         self.assertFalse(_is_safe_to_remove("/Applications/Firefox.app", ()))
 

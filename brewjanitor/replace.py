@@ -79,28 +79,38 @@ def _is_safe_to_remove(app_path: str, allowed_roots: tuple[str, ...]) -> bool:
       allowed root. Checking only the resolved form let a bundle be approved on
       the strength of where it points while rmtree acted on where it sits (and
       vice versa); requiring both closes that gap.
+
+    Each form is compared against the matching form of the root -- literal
+    against literal, resolved against resolved. Comparing a literal path to a
+    resolved root instead rejects anything under a symlinked ANCESTOR that the
+    two share, which on macOS includes every path under /var (a symlink to
+    /private/var). That refuses legitimate bundles rather than admitting bad
+    ones, but a guard that quietly says no to real work gets removed, and then
+    it protects nothing.
     """
     literal = Path(os.path.abspath(app_path))
     resolved = Path(app_path).resolve(strict=False)
     if literal.suffix.lower() != ".app" or resolved.suffix.lower() != ".app":
         return False
 
-    def _inside(target: Path) -> bool:
-        for root in allowed_roots:
-            try:
-                root_resolved = Path(root).resolve(strict=False)
-            except OSError:
-                continue
-            if target == root_resolved:
-                return False  # the root itself is never removable
-            try:
-                target.relative_to(root_resolved)
-            except ValueError:
-                continue
-            return True
-        return False
+    def _inside(target: Path, root: Path) -> bool:
+        if target == root:
+            return False  # the root itself is never removable
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return False
+        return True
 
-    return _inside(literal) and _inside(resolved)
+    for raw_root in allowed_roots:
+        try:
+            root_literal = Path(os.path.abspath(raw_root))
+            root_resolved = Path(raw_root).resolve(strict=False)
+        except OSError:
+            continue
+        if _inside(literal, root_literal) and _inside(resolved, root_resolved):
+            return True
+    return False
 
 
 def _remove_bundle(app_path: str) -> tuple[bool, str]:
