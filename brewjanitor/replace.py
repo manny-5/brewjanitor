@@ -108,9 +108,12 @@ def _verify_install(
 
         candidates = _cask_app_artifacts(info)
     else:
-        # Formulae rarely produce a single .app; treat any installed keg as a
-        # soft success since formula-managed apps are uncommon and unverified.
-        return True, "formula installed (no per-app verification)"
+        # Apps come from casks, not formulae. A formula candidate is almost
+        # always a mislabelled cask (see the brew-search header bug). We refuse
+        # to delete the original bundle for a formula "install", because we
+        # cannot confirm a formula placed a matching .app. This keeps the
+        # install-before-delete guarantee honest: no verified match, no delete.
+        return False, "formula installs are not auto-replaced (apps come from casks)"
 
     for art_path, bid in candidates:
         if app.bundle_id and bid and bid == app.bundle_id:
