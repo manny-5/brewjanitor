@@ -174,13 +174,16 @@ def reconcile(
     # collects both, so a leftover from a pkg cask install is detectable here
     # the same way an app cask leftover is -- by the bundle id brew itself uses
     # to manage the app.
-    from .brewsearch import _cask_bundle_ids
+    from .brewsearch import _cask_bundle_ids, _cask_is_pkg
 
     by_bundle_id: dict[str, str] = {}
+    pkg_tokens: set[str] = set()
     for cask in brew.info_installed_all(is_cask=True):
         token = cask.get("token") or cask.get("full_name") or cask.get("name") or ""
         if not isinstance(token, str) or not token:
             continue
+        if _cask_is_pkg(cask):
+            pkg_tokens.add(token)
         for bid in _cask_bundle_ids(cask):
             by_bundle_id.setdefault(bid, token)
 
@@ -221,6 +224,27 @@ def reconcile(
         if not match_name:
             results.append(
                 ReplaceResult(app=a, brew_name="", brew_kind="", status="skipped", reason="no brew cask owns this bundle id; not an orphan")
+            )
+            continue
+
+        # A pkg cask (Malwarebytes, Microsoft Office, NordVPN) does not report
+        # owned .app paths to by_path, so its brew-managed /Applications install
+        # is indistinguishable from a genuine leftover by path here -- a bundle-id
+        # match would otherwise declare the brew-managed app itself an orphan and
+        # rmtree it. Unlike an app cask, where by_path reliably owns the managed
+        # copy and a non-owned same-bundle-id bundle is a real leftover, a pkg
+        # cask gives no path signal to tell the two apart. Refuse to remove and
+        # report it for the user to inspect manually.
+        if match_name in pkg_tokens:
+            results.append(
+                ReplaceResult(
+                    app=a, brew_name=match_name, brew_kind="cask", status="skipped",
+                    reason=(
+                        f"brew manages the {match_name} pkg cask but does not report its "
+                        f"install path, so this could be the managed copy rather than a "
+                        f"leftover; left untouched (inspect {a.path} manually)"
+                    ),
+                )
             )
             continue
 
@@ -455,19 +479,41 @@ def replace(
             )
             continue
 
+        # A pkg cask NEVER has its original bundle removed by brewjanitor. A pkg
+        # installer does not report a single owned .app path the way an app cask
+        # does, so the in-place vs. leftover decision that is safe for app casks
+        # is NOT safe here: brew's JSON for an installed pkg cask can surface the
+        # installed .app in a way that makes `owned` non-empty yet not match the
+        # original path, which the app-cask logic treats as "separate copy, remove
+        # the original" -- and that rmtree would delete brew's own copy. The
+        # bundle-id match that passed verify confirms brew manages an app of this
+        # identity, but it cannot prove the bundle at `cand.app.path` is a
+        # *separate* copy rather than the very one brew installed. With no
+        # reliable way to tell the two apart, the only safe action is to remove
+        # nothing and report the install as done. The user can run `--reconcile`
+        # later if a genuine separate leftover exists; reconcile's own bundle-id
+        # match is safe there because it only removes bundles NOT at a path brew
+        # owns (by_path), which a pkg cask's /Applications install IS.
+        if is_pkg:
+            results.append(
+                ReplaceResult(
+                    app=cand.app,
+                    brew_name=cand.brew_name,
+                    brew_kind=cand.brew_kind,
+                    status="replaced",
+                    reason=(
+                        f"brew now manages {cand.app.name} as {cand.brew_name} "
+                        f"(pkg cask; installed in place, nothing removed)"
+                    ),
+                )
+            )
+            continue
+
         # Adopted in place: brew now owns the very bundle we started from, so
         # there is nothing left to delete. This is the common, and by far the
-        # safest, outcome -- the whole rmtree path below is skipped.
-        #
-        # A pkg cask reports no owned .app paths (its installer does not land at
-        # a single path brew records), so `owned` is empty and a naive check
-        # would fall through to removal. It must not: a pkg install typically
-        # placed the .app exactly where the original already sat, so removing
-        # the original would delete brew's own copy. The verify step already
-        # confirmed brew now manages an app of this bundle id; without a path to
-        # tell the two apart, the only safe assumption is in place. So an empty
-        # `owned` for a verified pkg cask means "no separate copy detected".
-        if _normalize_path(cand.app.path) in owned or (is_pkg and not owned):
+        # safest, outcome -- the whole rmtree path below is skipped. (App casks
+        # only; pkg casks are handled above and never reach removal.)
+        if _normalize_path(cand.app.path) in owned:
             results.append(
                 ReplaceResult(
                     app=cand.app,
@@ -481,7 +527,7 @@ def replace(
 
         # Otherwise brew installed a fresh copy somewhere else (typically the
         # original lives in ~/Applications while the cask installs to
-        # /Applications), so the original really is a leftover.
+        # /Applications), so the original really is a leftover. (App casks only.)
         if not _is_safe_to_remove(cand.app.path, roots):
             results.append(
                 ReplaceResult(
