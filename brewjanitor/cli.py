@@ -31,6 +31,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "replaces the rest with brew-managed installs where possible."
         ),
     )
+    # The scan is the default; its flags live directly on the top-level parser so
+    # `brewjanitor --apply` keeps working without a subcommand.
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -58,6 +60,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print per-app progress as the search step runs, so a long scan shows "
         "it is moving instead of appearing stuck.",
     )
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+    autoupdate_desc = (
+        "Manage a user-level launchd job that runs `brew update && brew upgrade` "
+        "daily. No sudo; the job runs as you from your own ~/Library/LaunchAgents "
+        "and only ever calls brew. See `brewjanitor autoupdate --help`."
+    )
+    au = sub.add_parser("autoupdate", help=autoupdate_desc, description=autoupdate_desc)
+    au.add_argument("--install", action="store_true", help="Install or replace the job.")
+    au.add_argument("--remove", action="store_true", help="Remove the scheduled job.")
+    au.add_argument("--status", action="store_true", help="Show the current job.")
+    au.add_argument("--hour", type=int, default=8, help="Hour 0-23 to run (default 8).")
+    au.add_argument("--minute", type=int, default=0, help="Minute 0-59 (default 0).")
+    au.add_argument(
+        "--greedy",
+        action="store_true",
+        help="Also upgrade casks that auto-update themselves (may quit running apps).",
+    )
+    au.add_argument("--cleanup", action="store_true", help="Also run `brew cleanup`.")
     return parser
 
 
@@ -141,10 +161,35 @@ def run(apply: bool, report_path: str | None, offline: bool = False, verbose: bo
     return 0
 
 
+def _run_autoupdate(args: argparse.Namespace) -> int:
+    """Dispatch the `autoupdate` subcommand to its handlers (no re-parsing)."""
+    from . import autoupdate as _au
+
+    if args.remove:
+        return _au.remove()
+    if args.status:
+        return _au.status()
+    if args.install:
+        if not 0 <= args.hour <= 23:
+            print("--hour must be 0-23", file=sys.stderr)
+            return 1
+        if not 0 <= args.minute <= 59:
+            print("--minute must be 0-59", file=sys.stderr)
+            return 1
+        return _au.install(args.hour, args.minute, args.greedy, args.cleanup)
+    # No action given: print the autoupdate help.
+    from . import autoupdate as _au2
+
+    _au2.main(["--help"])
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """`brewjanitor` entry point (see pyproject [project.scripts])."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "command", None) == "autoupdate":
+        return _run_autoupdate(args)
     return run(apply=args.apply, report_path=args.report, offline=args.offline, verbose=args.verbose)
 
 

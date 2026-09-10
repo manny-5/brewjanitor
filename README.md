@@ -107,6 +107,52 @@ you trust the name matches.
 
 ---
 
+## Scheduled upgrades (autoupdate)
+
+brewjanitor can install a daily `brew update && brew upgrade` job using macOS's
+built-in scheduler (`launchd`). It is fully user-level and auditable:
+
+- The job lives in **`~/Library/LaunchAgents/`** (your own home folder), never
+  the system folder, so it runs as **you** with **your** permissions and never
+  needs `sudo`.
+- The file is **plain XML** — open it and read the whole thing before you trust
+  it. The only command it ever runs is `brew` (update, upgrade, optionally
+  `--greedy`/`--cleanup`). Nothing else is downloaded or executed.
+- The absolute path to **your** `brew` is baked in, so it runs the same brew you
+  use interactively.
+- Installing it does **not** run an upgrade immediately (`RunAtLoad` is off);
+  it only fires at the scheduled time.
+
+### Install the daily upgrade
+
+```bash
+brewjanitor autoupdate --install              # daily at 08:00
+brewjanitor autoupdate --install --hour 7 --minute 15   # at 07:15
+brewjanitor autoupdate --install --greedy     # also upgrade self-updating casks
+brewjanitor autoupdate --install --cleanup     # also run `brew cleanup`
+```
+
+After install, read the plist to confirm what it does:
+```bash
+cat ~/Library/LaunchAgents/com.manny.brewjanitor.autoupdate.plist
+```
+
+### Check / stop it
+
+```bash
+brewjanitor autoupdate --status    # show schedule + command
+brewjanitor autoupdate --remove     # unload and delete the job (no sudo)
+```
+
+Logs of each run go to `~/Library/Logs/brewjanitor/autoupdate.log`.
+
+> ⚠️ `--greedy` upgrades casks that auto-update themselves (browsers, VS Code,
+> etc.) and may quit a running app to replace it. Omit it for a gentler daily
+> upgrade. To protect a specific package from ever being upgraded, pin it:
+> `brew pin <name>`.
+
+---
+
 ## What each command does, in plain terms
 
 | Command | What it does | Changes your machine? |
@@ -116,6 +162,8 @@ you trust the name matches.
 | `brewjanitor --report X.csv` | Prints a plan + writes the can't-replace list to a CSV | No (only writes the CSV you named) |
 | `brewjanitor --apply` | Installs via brew, verifies, removes old bundles | **Yes** |
 | `brewjanitor --offline` | Skips `brew info` verification (faster, less sure) | Only with `--apply` |
+| `brewjanitor autoupdate --install` | Schedules a daily `brew upgrade` (user-level launchd) | Yes (writes one plist to ~/Library/LaunchAgents) |
+| `brewjanitor autoupdate --remove` | Removes the scheduled job | Yes (deletes that plist) |
 
 ---
 
@@ -136,7 +184,8 @@ brewjanitor is built in stages, each safe to run on its own:
    installs the brew item, verifies the install, then removes the old bundle. On
    any failure the old bundle is left untouched.
 5. **Report** (`report.py`) — writes the couldn't-be-replaced apps to a CSV.
-6. **CLI** (`cli.py`) — wires it all together behind the `brewjanitor` command.
+6. **CLI** (`cli.py`) — wires it all together behind the `brewjanitor` command,
+   plus an `autoupdate` subcommand (see below) for scheduled upgrades.
 
 You can also run any piece directly, e.g.:
 
