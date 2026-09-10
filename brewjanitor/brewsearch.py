@@ -9,15 +9,23 @@ For every unmanaged App:
   1. Derive a search term from the bundle name by stripping the ".app" suffix
      (e.g. "Firefox.app" -> "firefox"). This is the most reliable, user-facing
      token Homebrew indexes casks by.
-  2. `brew search <term>` returns candidate formula/cask names.
-  3. For each candidate, `brew info --json=v2 <name>` (read-only) confirms it is
-     real and, for casks, reads the .app bundle path(s) and bundle id(s) it would
-     install. We prefer a cask whose artifact app path or bundle id matches the
-     discovered app; failing that we accept the first resolvable cask candidate
-     as "installable but unverified".
-  4. Result: an `AppCandidate` per app — installable=True/False, the chosen brew
-     name/kind, and a `verified` flag saying whether we matched on path or
-     bundle id (high confidence) vs. just found a same-named cask.
+  2. `brew search --casks <term>` returns candidate cask names. The `--casks`
+     scope matters: an unscoped `brew search` groups its output under `==>
+     Formulae` / `==> Casks` headers that brew emits ONLY when stdout is a TTY,
+     and we always capture through a pipe. Scoping the query means brew returns
+     bare names with nothing to parse and no way to mistake a cask for a formula.
+  3. An exact name match makes the app installable. `brew search` matches
+     substrings, so exactness is what stops "Firefox.app" from picking up
+     "firefox@nightly".
+  4. Optionally (`verify=True`, used right before --apply), `brew info
+     --json=v2 <name>` confirms the cask really installs an .app matching this
+     one by bundle id or filename.
+  5. Result: an `AppCandidate` per app — installable=True/False, the chosen cask
+     name, and a `verified` flag saying whether we matched on path or bundle id
+     (high confidence) vs. just found a same-named cask.
+
+Casks only: a formula never provides a .app bundle, so formulae are not
+candidates. See _evaluate for why accepting them was actively harmful.
 
 Everything here is read-only (search + info only). No install happens yet; that
 is piece 4, and only under `--apply`. When `brew` is unavailable, every app is
@@ -33,11 +41,6 @@ from pathlib import Path
 
 from .brewcheck import Brew
 from .inventory import App
-
-
-def _is_cask_candidate(raw: str) -> bool:
-    """True if a brew search line is a cask (suffixed ` (cask)`)."""
-    return raw.strip().endswith("(cask)")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,7 +65,6 @@ class AppCandidate:
 
 
 _TERM_SUFFIX = re.compile(r"\.app$", re.IGNORECASE)
-_PARENS_CASK = re.compile(r"\s*\(cask\)\s*$")
 
 
 def _search_term(app: App) -> str:
@@ -72,14 +74,8 @@ def _search_term(app: App) -> str:
     suffix, collapse whitespace into hyphens, and lowercase. This keeps the term
     compatible with `brew search`, which matches the term against cask names."""
     name = _TERM_SUFFIX.sub("", app.name)
-    name = _PARENS_CASK.sub("", name)
     name = re.sub(r"\s+", "-", name.strip())
     return name.lower()
-
-
-def _clean_candidate(raw: str) -> str:
-    """Strip the trailing ` (cask)` that brew search appends to cask names."""
-    return _PARENS_CASK.sub("", raw).strip()
 
 
 def _cask_app_artifacts(info: dict) -> list[tuple[str, str]]:
@@ -114,22 +110,23 @@ def _app_name_lower(app: App) -> str:
     return name.lower()
 
 
-def _pick_cask_by_name(app: App, candidates: list[str]) -> str | None:
+def _pick_cask_by_name(app: App, cask_candidates: list[str]) -> str | None:
     """Return the cask name that matches the app's normalized name, or None.
 
-    This is the fast path: no `brew info` network call. Casks install apps, so
-    we only consider cask candidates (lines suffixed ` (cask)`) whose cleaned
-    name equals the app's hyphenated lowercased name. A name match alone is not
-    enough to call something `verified` -- that requires a brew info artifact
-    check -- but it is enough to decide the app is installable.
+    This is the fast path: no `brew info` network call. `cask_candidates` comes
+    from `brew search --casks`, so every entry is already known to be a cask --
+    we just need an exact name match against the app's hyphenated lowercased
+    name. `brew search` matches substrings, so an exact comparison is what keeps
+    "Firefox.app" from picking up "firefox@nightly" or "multifirefox".
+
+    A name match alone is not enough to call something `verified` -- that
+    requires a brew info artifact check -- but it is enough to decide the app is
+    installable.
     """
     term = _app_name_lower(app)
-    for raw in candidates:
-        if not _is_cask_candidate(raw):
-            continue
-        name = _clean_candidate(raw)
-        if name == term:
-            return name
+    for name in cask_candidates:
+        if name.strip() == term:
+            return name.strip()
     return None
 
 
@@ -152,18 +149,25 @@ def _verify_cask(app: App, brew: Brew, name: str) -> bool:
 
 
 def _evaluate(
-    app: App, candidates: list[str], brew: Brew, verify: bool = False
+    app: App, cask_candidates: list[str], brew: Brew, verify: bool = False
 ) -> AppCandidate:
-    """Pick the best brew candidate for one app from its search results.
+    """Pick the best brew candidate for one app from its cask search results.
 
     Fast by default: a cask whose name matches the app is accepted as
     installable (verified=False) with no `brew info` call. When `verify` is
     True (e.g. right before --apply), the chosen cask is confirmed via
     `brew info` against the app's bundle id or .app filename, and verified is
-    set accordingly. Formula candidates are only accepted as a last resort.
+    set accordingly.
+
+    Casks only. A formula is never a replacement for a .app bundle, and treating
+    one as a candidate produces actively wrong matches -- "R.app" name-matches
+    the `r` formula (the R language CLI), which has nothing to do with the GUI
+    app. replace() already refuses to act on formula candidates, so accepting
+    them here only inflated the "could be installed" count with entries that
+    could never actually be replaced. An app with no matching cask is reported
+    not-installable, which is the truthful answer.
     """
-    # Preferred: a same-named cask.
-    cask_name = _pick_cask_by_name(app, candidates)
+    cask_name = _pick_cask_by_name(app, cask_candidates)
     if cask_name is not None:
         verified = _verify_cask(app, brew, cask_name) if verify else False
         return AppCandidate(
@@ -173,20 +177,6 @@ def _evaluate(
             brew_kind="cask",
             verified=verified,
         )
-
-    # Last resort: a same-named formula (apps rarely install from formulae).
-    term = _app_name_lower(app)
-    for raw in candidates:
-        if _is_cask_candidate(raw):
-            continue
-        if _clean_candidate(raw) == term:
-            return AppCandidate(
-                app=app,
-                installable=True,
-                brew_name=term,
-                brew_kind="formula",
-                verified=False,
-            )
 
     return AppCandidate(app=app, installable=False, brew_name="", brew_kind="", verified=False)
 
@@ -231,8 +221,10 @@ def search(
     for index, app in enumerate(apps, start=1):
         if progress:
             print(f"searching [{index}/{total}] {app.name} ...", file=sys.stderr, flush=True)
-        candidates = brew.search(_search_term(app))
-        results.append(_evaluate(app, candidates, brew, verify=verify and not offline))
+        cask_candidates = brew.search_casks(_search_term(app))
+        results.append(
+            _evaluate(app, cask_candidates, brew, verify=verify and not offline)
+        )
     return results
 
 

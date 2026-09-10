@@ -89,9 +89,40 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _note_prerelease_macos(brew: Brew, apply: bool) -> None:
+    """Say once, up front, that Homebrew considers this macOS unsupported.
+
+    Worth stating plainly because the consequences are narrower than the
+    warning sounds, and silence would leave brew's own warning (which only
+    appears on install, and only on stderr) to arrive unexplained mid-run.
+
+    Casks are unaffected: they ship prebuilt applications that do not depend on
+    the OS build, and `brew search --casks`, `brew info --json` and cask
+    installs were all verified to behave identically here. What a pre-release
+    macOS does change is *formulae*, which are built per-OS -- and brewjanitor
+    does not install formulae.
+    """
+    if brew.prerelease_macos() is not True:
+        return
+    print(
+        "Note: Homebrew considers this macOS a pre-release and does not support it.\n"
+        "      This does not affect brewjanitor: it installs casks, which are\n"
+        "      prebuilt apps and OS-independent. (Formulae are built per-OS and\n"
+        "      would be the part affected -- brewjanitor installs none.)",
+        file=sys.stderr,
+    )
+    if apply:
+        print(
+            "      brew may print its own pre-release warning during --apply; that is\n"
+            "      expected, and brew's output is shown to you in full.",
+            file=sys.stderr,
+        )
+
+
 def run(apply: bool, report_path: str | None, offline: bool = False, verbose: bool = False) -> int:
     """Run the full pipeline. Returns a process exit code."""
     brew = Brew()
+    _note_prerelease_macos(brew, apply)
     if not brew.available:
         print(
             "brew not found on PATH; install Homebrew first (https://brew.sh).",
