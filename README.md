@@ -3,13 +3,12 @@
 **brewjanitor** brings the software on your Mac into the fold of [Homebrew](https://brew.sh).
 
 It scans your Mac for installed apps, figures out which ones Homebrew already
-manages, and — for the rest — checks whether Homebrew *could* install them. When
+manages, and for the rest, checks whether Homebrew *could* install them. When
 it can, brewjanitor offers to replace the app with a Homebrew-managed copy
 (install the new one first, verify it, then remove the old one). Apps that
 Homebrew can't install are left alone and listed in a report.
 
-It is **safe by default**: with no flags it only inspects your machine and prints
-a plan. An explicit `--apply` is required to actually install or delete
+An explicit `--apply` is required to actually install or delete
 anything.
 
 ---
