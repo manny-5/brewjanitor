@@ -233,6 +233,12 @@ brewjanitor is built in stages, each safe to run on its own:
    `formulae` subcommand for the read-only command-line-tool survey.
 7. **Binaries** (`binaries.py`) — the formula-side survey. Report-only by
    design: it never installs and never deletes. Read-only.
+8. **Streams** (`streams.py`) — ordered writes to stdout and stderr. Results go
+   to stdout so `brewjanitor | grep ...` works; progress and summaries go to
+   stderr. The two buffer differently, so each write flushes the other stream
+   first — otherwise, whenever both land in the same terminal or file, the
+   lines arrive out of order (a summary once printed *above* the results it
+   summarised).
 
 You can also run any piece directly, e.g.:
 

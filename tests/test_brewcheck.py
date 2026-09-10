@@ -255,3 +255,87 @@ class TestPrereleaseDetection(unittest.TestCase):
         b.prerelease_macos()
         b.prerelease_macos()
         self.assertEqual(len(calls), 1)
+
+
+class TestFormulaOwnership(unittest.TestCase):
+    """Formula kegs, rebuilt from brew's layout rather than from absent keys.
+
+    `brew info --json=v2 --installed --formula` reports NO path for an
+    installed formula -- the `installed[]` entries carry only version and
+    bottle metadata. The previous code read `installed_as_dependency_path` and
+    `installed_on`, neither of which brew emits, so formula ownership silently
+    matched nothing at all.
+    """
+
+    def _formula(self, name="wget", versions=("1.25.0",), full_name=None):
+        return {
+            "name": name,
+            "full_name": full_name or name,
+            "installed": [{"version": v} for v in versions],
+        }
+
+    def test_keg_paths_are_built_from_prefix_name_and_version(self):
+        paths = brewcheck._formula_keg_paths(self._formula(), "/opt/homebrew")
+        self.assertIn("/opt/homebrew/Cellar/wget/1.25.0", paths)
+
+    def test_the_opt_symlink_is_included(self):
+        # An app symlinked out of a keg may resolve through opt/ instead.
+        paths = brewcheck._formula_keg_paths(self._formula(), "/opt/homebrew")
+        self.assertIn("/opt/homebrew/opt/wget", paths)
+
+    def test_every_installed_version_gets_a_keg(self):
+        paths = brewcheck._formula_keg_paths(
+            self._formula(versions=("1.0", "2.0")), "/opt/homebrew")
+        self.assertIn("/opt/homebrew/Cellar/wget/1.0", paths)
+        self.assertIn("/opt/homebrew/Cellar/wget/2.0", paths)
+
+    def test_a_tapped_formula_uses_its_bare_name_for_the_cellar(self):
+        # full_name is "someone/tap/foo" but the Cellar directory is "foo".
+        paths = brewcheck._formula_keg_paths(
+            self._formula(name="foo", full_name="someone/tap/foo"), "/opt/homebrew")
+        self.assertIn("/opt/homebrew/Cellar/foo/1.25.0", paths)
+        self.assertNotIn("/opt/homebrew/Cellar/someone/tap/foo/1.25.0", paths)
+
+    def test_no_prefix_means_no_paths_rather_than_bogus_ones(self):
+        self.assertEqual(brewcheck._formula_keg_paths(self._formula(), ""), [])
+
+    def test_a_formula_with_no_versions_still_yields_its_opt_link(self):
+        paths = brewcheck._formula_keg_paths(self._formula(versions=()), "/opt/homebrew")
+        self.assertEqual(paths, ["/opt/homebrew/opt/wget"])
+
+    def test_an_app_inside_a_keg_is_reported_as_formula_managed(self):
+        brew = FakeBrew(installed_formulae=[self._formula("python@3.14", ("3.14.7",))])
+        app = App(
+            name="IDLE 3.app",
+            path="/opt/homebrew/Cellar/python@3.14/3.14.7/IDLE 3.app",
+            bundle_id="org.python.IDLE",
+        )
+        result = check([app], brew)[0]
+        self.assertTrue(result.brew_managed)
+        self.assertEqual(result.brew_kind, "formula")
+        self.assertEqual(result.brew_name, "python@3.14")
+
+    def test_a_keg_prefix_does_not_match_a_sibling_directory(self):
+        # "/opt/homebrew/Cellar/wget" must not claim ".../wget-extras/X.app".
+        brew = FakeBrew(installed_formulae=[self._formula("wget", ("1.0",))])
+        app = App(name="X.app", path="/opt/homebrew/Cellar/wget-extras/1.0/X.app", bundle_id="")
+        self.assertFalse(check([app], brew)[0].brew_managed)
+
+    def test_a_keg_prefix_does_not_match_a_name_prefixed_sibling(self):
+        # The case a naive startswith() gets wrong: the opt link
+        # "/opt/homebrew/opt/wget" is a literal string prefix of
+        # "/opt/homebrew/opt/wget-extras/...", so matching must be
+        # separator-aware, not textual.
+        brew = FakeBrew(installed_formulae=[self._formula("wget", ("1.0",))])
+        app = App(name="X.app", path="/opt/homebrew/opt/wget-extras/X.app", bundle_id="")
+        self.assertFalse(check([app], brew)[0].brew_managed)
+
+    def test_an_app_outside_every_keg_is_unmanaged(self):
+        brew = FakeBrew(installed_formulae=[self._formula()])
+        app = App(name="Firefox.app", path="/Applications/Firefox.app", bundle_id="")
+        self.assertFalse(check([app], brew)[0].brew_managed)
+
+    def test_ownership_build_returns_keg_prefixes(self):
+        brew = FakeBrew(installed_formulae=[self._formula()])
+        _, _, kegs = brewcheck._build_brew_ownership(brew)
+        self.assertTrue(any(k.endswith("Cellar/wget/1.25.0") for k, _ in kegs))

@@ -25,6 +25,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .streams import err as _err, out as _out
+
 LABEL = "com.manny.brewjanitor.autoupdate"
 
 
@@ -46,6 +48,20 @@ def _resolve_brew() -> str | None:
     return shutil.which("brew")
 
 
+def _command_line(brew_path: str, greedy: bool, cleanup: bool) -> str:
+    """The exact shell command the scheduled job runs.
+
+    Shared by the plist and by what `--install` prints, so the two cannot
+    drift: the line you are shown is built from the same code that goes into
+    the job, not reconstructed alongside it.
+    """
+    upgrade = f"{brew_path} upgrade" + (" --greedy" if greedy else "")
+    steps = [f"{brew_path} update", upgrade]
+    if cleanup:
+        steps.append(f"{brew_path} cleanup")
+    return " && ".join(steps)
+
+
 def _build_plist(
     brew_path: str,
     hour: int,
@@ -60,16 +76,7 @@ def _build_plist(
     NOT set RunAtLoad (so installing it never runs an upgrade immediately) and
     we keep StandardErrorPath so you can see why a run failed.
     """
-    args: list[list[str]] = [
-        [brew_path, "update"],
-        [brew_path, "upgrade"],
-    ]
-    if greedy:
-        args[-1].append("--greedy")
-    if cleanup:
-        args.append([brew_path, "cleanup"])
-
-    program: list[str] = ["/bin/bash", "-c", " && ".join(" ".join(a) for a in args)]
+    program: list[str] = ["/bin/bash", "-c", _command_line(brew_path, greedy, cleanup)]
 
     log_dir = Path.home() / "Library" / "Logs" / "brewjanitor"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -99,7 +106,7 @@ def install(hour: int, minute: int, greedy: bool, cleanup: bool) -> int:
     """
     brew_path = _resolve_brew()
     if not brew_path:
-        print("brew not found on PATH; install Homebrew first.", file=sys.stderr)
+        _err("brew not found on PATH; install Homebrew first.")
         return 1
 
     plist_dir = _launch_agents_dir()
@@ -112,17 +119,13 @@ def install(hour: int, minute: int, greedy: bool, cleanup: bool) -> int:
     data = _build_plist(brew_path, hour, minute, greedy, cleanup)
     target.write_bytes(data)
 
-    print(f"Resolved brew: {brew_path}")
-    print(f"Wrote plist: {target}")
-    print("The job runs ONLY these commands:")
-    print(f"    {brew_path} update && {brew_path} upgrade", end="")
-    if greedy:
-        print(" --greedy", end="")
-    if cleanup:
-        print(f" && {brew_path} cleanup", end="")
-    print(f"\nat {hour:02d}:{minute:02d} every day.")
-    print("Read the plist before trusting it: it is plain XML.")
-    print()
+    _out(f"Resolved brew: {brew_path}")
+    _out(f"Wrote plist: {target}")
+    _out("The job runs ONLY these commands:")
+    _out(f"    {_command_line(brew_path, greedy, cleanup)}")
+    _out(f"at {hour:02d}:{minute:02d} every day.")
+    _out("Read the plist before trusting it: it is plain XML.")
+    _out()
 
     load_result = subprocess.run(
         ["launchctl", "load", str(target)],
@@ -132,13 +135,10 @@ def install(hour: int, minute: int, greedy: bool, cleanup: bool) -> int:
         text=True,
     )
     if load_result.returncode != 0:
-        print(
-            "launchctl load failed:\n" + (load_result.stderr or load_result.stdout),
-            file=sys.stderr,
-        )
+        _err("launchctl load failed:\n" + (load_result.stderr or load_result.stdout))
         return 1
-    print("Loaded. Daily upgrade is scheduled (no sudo used).")
-    print("To stop: brewjanitor autoupdate --remove")
+    _out("Loaded. Daily upgrade is scheduled (no sudo used).")
+    _out("To stop: brewjanitor autoupdate --remove")
     return 0
 
 
@@ -146,7 +146,7 @@ def unload(silent: bool = False) -> int:
     """Unload the launchd job if it is loaded. No-op if not loaded."""
     target = _plist_path()
     if not target.exists() and not silent:
-        print("No autoupdate job installed.")
+        _out("No autoupdate job installed.")
         return 0
     subprocess.run(
         ["launchctl", "unload", str(target)],
@@ -164,30 +164,53 @@ def remove() -> int:
     target = _plist_path()
     if target.exists():
         target.unlink()
-        print(f"Removed {target}")
+        _out(f"Removed {target}")
     else:
-        print("No autoupdate job installed.")
+        _out("No autoupdate job installed.")
     return 0
+
+
+def _describe_schedule(sched: object) -> str:
+    """Render StartCalendarInterval for humans, whatever is actually in there.
+
+    `status` reads a file on disk that this tool does not exclusively own: it
+    can be hand-edited, written by an older version, or belong to a different
+    job entirely. A missing Hour used to reach an f-string `:02d` and raise
+    ValueError, so inspecting a malformed job crashed instead of describing it
+    -- the one moment you most want a readable answer.
+    """
+    if not isinstance(sched, dict):
+        return "unknown (no StartCalendarInterval in the plist)"
+    hour, minute = sched.get("Hour"), sched.get("Minute", 0)
+    if not isinstance(hour, int) or not isinstance(minute, int):
+        return f"unknown (malformed StartCalendarInterval: {sched!r})"
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return f"out of range (Hour={hour}, Minute={minute})"
+    return f"daily at {hour:02d}:{minute:02d}"
+
+
+def _describe_command(args: object) -> str:
+    """Render ProgramArguments, coercing whatever the plist holds to text."""
+    if not isinstance(args, list) or not args:
+        return "unknown (no ProgramArguments in the plist)"
+    return " ".join(str(a) for a in args)
 
 
 def status() -> int:
     """Show whether the job is installed and its current schedule."""
     target = _plist_path()
     if not target.exists():
-        print("No autoupdate job installed.")
-        print("Install with: brewjanitor autoupdate --install")
+        _out("No autoupdate job installed.")
+        _out("Install with: brewjanitor autoupdate --install")
         return 0
     try:
         plist = plistlib.loads(target.read_bytes())
     except Exception as exc:
-        print(f"Could not parse {target}: {exc}", file=sys.stderr)
+        _err(f"Could not parse {target}: {exc}")
         return 1
-    sched = plist.get("StartCalendarInterval", {})
-    hour = sched.get("Hour", "?")
-    minute = sched.get("Minute", 0)
-    print(f"Installed: {target}")
-    print(f"Schedule: daily at {hour:02d}:{minute:02d}")
-    print(f"Command: {' '.join(plist.get('ProgramArguments', []))}")
+    _out(f"Installed: {target}")
+    _out(f"Schedule: {_describe_schedule(plist.get('StartCalendarInterval'))}")
+    _out(f"Command: {_describe_command(plist.get('ProgramArguments'))}")
     return 0
 
 
@@ -240,10 +263,10 @@ def main(argv: list[str] | None = None) -> int:
         return status()
     if args.install:
         if not 0 <= args.hour <= 23:
-            print("--hour must be 0-23", file=sys.stderr)
+            _err("--hour must be 0-23")
             return 1
         if not 0 <= args.minute <= 59:
-            print("--minute must be 0-59", file=sys.stderr)
+            _err("--minute must be 0-59")
             return 1
         return install(args.hour, args.minute, args.greedy, args.cleanup)
 

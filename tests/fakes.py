@@ -53,13 +53,17 @@ class FakeBrew:
         formulae_by_term=None,
         info_by_name=None,
         installed_casks=(),
+        installed_formulae=(),
         install_result=None,
+        prefix="/opt/homebrew",
     ):
         self.available = available
         self._casks_by_term = casks_by_term or {}
         self._formulae_by_term = formulae_by_term or {}
         self._info_by_name = info_by_name or {}
         self._installed_casks = list(installed_casks)
+        self._installed_formulae = list(installed_formulae)
+        self._prefix = prefix
         self._install_result = install_result or ok()
         # Recorded calls, for assertions.
         self.install_calls: list[tuple[str, bool, bool]] = []
@@ -82,13 +86,16 @@ class FakeBrew:
         return self._info_by_name.get(name)
 
     def info_installed_all(self, is_cask):
-        return list(self._installed_casks) if is_cask else []
+        return list(self._installed_casks) if is_cask else list(self._installed_formulae)
+
+    def prefix(self):
+        return self._prefix
 
     def list_casks(self):
         return [c.get("token", "") for c in self._installed_casks]
 
     def list_formulae(self):
-        return []
+        return [f.get("name", "") for f in self._installed_formulae]
 
     # --- mutating surface --------------------------------------------------
     def install(self, name, is_cask, adopt=False):

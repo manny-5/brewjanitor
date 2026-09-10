@@ -37,6 +37,7 @@ import sys
 from pathlib import Path
 
 from .inventory import App
+from .streams import err as _err, out as _out
 
 # How long a single read-only brew call may take before we give up and treat it
 # as failed. Keeps a hung tap fetch from hanging the whole tool forever.
@@ -413,66 +414,34 @@ def _normalize(path: str) -> str:
         return os.path.normpath(path)
 
 
-def _cask_app_paths(info: dict) -> list[str]:
-    """Extract the .app bundle paths a cask installed from its info JSON.
+def _formula_keg_paths(formula: dict, brew_prefix: str) -> list[str]:
+    """Absolute paths an installed formula owns: its kegs and its opt link.
 
-    Cask JSON shape: casks[].artifacts[].app[] (strings) and/or
-    casks[].artifacts[].{ "app": [...] }. We collect any string that ends with
-    .app. brew info reports these as the install name (e.g. "Firefox.app") which
-    the cask installs into its appdir (casks[].artifacts[] can carry an explicit
-    "app" target, but the default appdir is /Applications). Callers must anchor a
-    relative name against the appdir before comparing to an absolute inventory
-    path -- see _build_brew_ownership.
+    Homebrew's JSON does NOT report a path for an installed formula. The
+    `installed[]` entries carry only version/bottle metadata -- the keys the
+    previous implementation read (`installed_as_dependency_path`,
+    `installed_on`) do not exist, so formula ownership silently never matched
+    anything. The path has to be constructed from brew's own layout:
+
+        <prefix>/Cellar/<name>/<version>   one per installed version
+        <prefix>/opt/<name>                the stable symlink to the linked keg
+
+    Both matter. An app symlinked out of a keg into /Applications resolves under
+    one or the other depending on how the link was made.
     """
-    paths: list[str] = []
-    for cask in info.get("casks", []):
-        for artifact in cask.get("artifacts", []) or []:
-            if isinstance(artifact, dict):
-                apps = artifact.get("app", [])
-            elif isinstance(artifact, list):
-                apps = artifact
-            else:
-                apps = []
-            for item in apps:
-                if isinstance(item, str) and item.endswith(".app"):
-                    paths.append(item)
-    return paths
-
-
-def _cask_appdir(info: dict) -> str:
-    """Return the directory a cask installs .app bundles into.
-
-    brew info exposes this as casks[].artifacts[].{ "app": { "target": ... } } in
-    newer Homebrew, or defaults to "/Applications". We scan for an explicit app
-    target and fall back to /Applications so a relative artifact name like
-    "Firefox.app" can be resolved to an absolute path for matching.
-    """
-    for cask in info.get("casks", []):
-        for artifact in cask.get("artifacts", []) or []:
-            if isinstance(artifact, dict):
-                app = artifact.get("app")
-                if isinstance(app, dict):
-                    target = app.get("target")
-                    if isinstance(target, str) and target:
-                        return target
-    return "/Applications"
-
-
-def _formula_paths(info: dict) -> list[str]:
-    """Extract installed paths for a formula from its info JSON.
-
-    Formulae rarely correspond to a single .app, but we collect any linked keg
-    path so path-based matching can still work for the few formulae that ship a
-    .app. The primary signal for formulae is the installed linked keg prefix.
-    """
-    paths: list[str] = []
-    for formula in info.get("formulae", []):
-        for keg in formula.get("installed", []) or []:
-            prefix = keg.get("installed_as_dependency_path") or keg.get("installed_on", {})
-            if isinstance(prefix, dict):
-                prefix = prefix.get("path")
-            if isinstance(prefix, str) and prefix:
-                paths.append(prefix)
+    if not brew_prefix:
+        return []
+    name = formula.get("full_name") or formula.get("name") or ""
+    if not isinstance(name, str) or not name:
+        return []
+    # A tapped formula's full_name ("someone/tap/foo") is not the Cellar
+    # directory; the Cellar always uses the bare name.
+    bare = formula.get("name") or name.rsplit("/", 1)[-1]
+    paths = [os.path.join(brew_prefix, "opt", bare)]
+    for keg in formula.get("installed", []) or []:
+        version = keg.get("version") if isinstance(keg, dict) else None
+        if isinstance(version, str) and version:
+            paths.append(os.path.join(brew_prefix, "Cellar", bare, version))
     return paths
 
 
@@ -517,16 +486,22 @@ def _cask_appdir_one(cask: dict) -> str:
     return "/Applications"
 
 
-def _build_brew_ownership(brew: Brew) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
+def _build_brew_ownership(
+    brew: Brew,
+) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]], list[tuple[str, str]]]:
     """Build two indexes of everything Homebrew owns.
 
-    Returns (by_path, by_basename):
+    Returns (by_path, by_basename, keg_prefixes):
       by_path: normalized absolute bundle path -> (brew_name, kind). Preferred.
       by_basename: lowercase .app filename -> (brew_name, kind). Fallback used
       when the cask only reports a relative artifact name we cannot anchor with
       full confidence (e.g. an appdir we did not detect). Matching by basename is
       less precise but catches the common case where an app sits in
       /Applications under the same name the cask installed.
+      keg_prefixes: (normalized keg directory, formula name) pairs. A formula
+      owns a whole directory tree rather than one bundle, so these are matched
+      by containment, not equality -- an .app symlinked out of a keg into
+      /Applications resolves to a path *under* the keg.
 
     Efficiency: this uses ONE `brew info --json=v2 --installed --cask` and ONE
     `... --formula` call to describe all installed items at once, instead of one
@@ -535,6 +510,7 @@ def _build_brew_ownership(brew: Brew) -> tuple[dict[str, tuple[str, str]], dict[
     """
     by_path: dict[str, tuple[str, str]] = {}
     by_basename: dict[str, tuple[str, str]] = {}
+    keg_prefixes: list[tuple[str, str]] = []
 
     casks = brew.info_installed_all(is_cask=True)
     if not casks:
@@ -549,26 +525,20 @@ def _build_brew_ownership(brew: Brew) -> tuple[dict[str, tuple[str, str]], dict[
         for cask in casks:
             _index_one_cask(cask, by_path, by_basename)
 
+    brew_prefix = brew.prefix()
     formulae = brew.info_installed_all(is_cask=False)
     if not formulae:
+        formulae = []
         for name in brew.list_formulae():
             info = brew.info_json(name, is_cask=False)
-            if not info:
-                continue
-            for formula in info.get("formulae", []):
-                for raw in _formula_paths({"formulae": [formula]}):
-                    by_path.setdefault(_normalize(raw), (formula.get("full_name") or name, "formula"))
-    else:
-        for formula in formulae:
-            fname = formula.get("full_name") or formula.get("name") or ""
-            for keg in formula.get("installed", []) or []:
-                prefix = keg.get("installed_as_dependency_path") or keg.get("installed_on", {})
-                if isinstance(prefix, dict):
-                    prefix = prefix.get("path")
-                if isinstance(prefix, str) and prefix:
-                    by_path.setdefault(_normalize(prefix), (fname, "formula"))
+            if info:
+                formulae.extend(info.get("formulae", []))
+    for formula in formulae:
+        fname = formula.get("full_name") or formula.get("name") or ""
+        for raw in _formula_keg_paths(formula, brew_prefix):
+            keg_prefixes.append((_normalize(raw), fname))
 
-    return by_path, by_basename
+    return by_path, by_basename, keg_prefixes
 
 
 def _index_one_cask(cask: dict, by_path: dict[str, tuple[str, str]], by_basename: dict[str, tuple[str, str]]) -> None:
@@ -599,7 +569,7 @@ def check(apps: list[App], brew: Brew | None = None) -> list[CheckedApp]:
     if not brew.available:
         return [CheckedApp(app=a, brew_managed=False, brew_name="", brew_kind="") for a in apps]
 
-    by_path, by_basename = _build_brew_ownership(brew)
+    by_path, by_basename, keg_prefixes = _build_brew_ownership(brew)
 
     checked: list[CheckedApp] = []
     for a in apps:
@@ -612,6 +582,15 @@ def check(apps: list[App], brew: Brew | None = None) -> list[CheckedApp]:
         # basename of an installed app is usually unique enough to be safe here.
         if match is None and a.name:
             match = by_basename.get(a.name.lower())
+        # Last: does the app live inside a formula's keg? A formula owns a
+        # directory tree, so this is a containment test. Catches the handful of
+        # formulae that ship a .app and symlink it into /Applications.
+        if match is None:
+            resolved = _normalize(a.path)
+            for keg, fname in keg_prefixes:
+                if resolved == keg or resolved.startswith(keg.rstrip("/") + os.sep):
+                    match = (fname, "formula")
+                    break
         if match:
             name, kind = match
             checked.append(CheckedApp(app=a, brew_managed=True, brew_name=name, brew_kind=kind))
@@ -630,10 +609,10 @@ def main() -> int:
 
     brew = Brew()
     if not brew.available:
-        print("brew not found on PATH; nothing is managed.", file=sys.stderr)
+        _err("brew not found on PATH; nothing is managed.")
     for item in check(inventory(), brew):
         flag = "managed" if item.brew_managed else "unmanaged"
-        print(
+        _out(
             f"{flag}\t{item.brew_kind}\t{item.brew_name}\t"
             f"{item.app.name}\t{item.app.path}\t{item.app.bundle_id}"
         )

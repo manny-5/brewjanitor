@@ -17,6 +17,8 @@ import plistlib
 import sys
 from pathlib import Path
 
+from .streams import out as _out
+
 # Directories we consider "user-installable" app locations. /System/Applications
 # is deliberately excluded: those bundles ship with macOS and are not something
 # brewjanitor should ever try to manage or replace.
@@ -109,7 +111,7 @@ def main() -> int:
     Exits 0 on success.
     """
     for app in inventory():
-        print(f"{app.name}\t{app.path}\t{app.bundle_id}")
+        _out(f"{app.name}\t{app.path}\t{app.bundle_id}")
     return 0
 
 
