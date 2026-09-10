@@ -60,6 +60,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print per-app progress as the search step runs, so a long scan shows "
         "it is moving instead of appearing stuck.",
     )
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Instead of the normal scan, detect and clean up leftover old bundles "
+        "from an interrupted --apply run (where brew installed the cask but the "
+        "old bundle was not removed). With --apply it removes the orphan; without "
+        "it just reports what it would remove. No re-install happens.",
+    )
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     autoupdate_desc = (
         "Manage a user-level launchd job that runs `brew update && brew upgrade` "
@@ -161,6 +169,41 @@ def run(apply: bool, report_path: str | None, offline: bool = False, verbose: bo
     return 0
 
 
+def _run_reconcile(apply: bool, verbose: bool) -> int:
+    """Detect and clean up leftover old bundles from an interrupted --apply.
+
+    Runs over the full inventory (so we catch orphans whether or not they'd
+    show as "unmanaged"). Uses replace.reconcile, which only removes the old
+    bundle when brew now manages a matching cask -- never re-installs.
+    """
+    from .replace import reconcile
+
+    brew = Brew()
+    if not brew.available:
+        print("brew not found on PATH; cannot reconcile.", file=sys.stderr)
+        return 1
+    apps = inventory()
+    print(f"Checking {len(apps)} app(s) for leftover old bundles ...", file=sys.stderr)
+    results = reconcile(apps, brew, apply=apply)
+    print("\nReconcile results:", file=sys.stderr)
+    for res in results:
+        if res.status == "skipped":
+            continue
+        print(
+            f"  [{res.status}] {res.app.name} "
+            f"({res.brew_kind} {res.brew_name}) -> {res.reason}"
+        )
+    leftovers = [r for r in results if r.status in ("dry-run", "replaced", "failed")]
+    if not leftovers:
+        print("No leftover old bundles found; nothing to clean up.", file=sys.stderr)
+    elif not apply:
+        print(
+            f"\n{len(leftovers)} leftover bundle(s) found. Re-run with --apply to remove them.",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def _run_autoupdate(args: argparse.Namespace) -> int:
     """Dispatch the `autoupdate` subcommand to its handlers (no re-parsing)."""
     from . import autoupdate as _au
@@ -190,6 +233,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if getattr(args, "command", None) == "autoupdate":
         return _run_autoupdate(args)
+    if args.reconcile:
+        return _run_reconcile(apply=args.apply, verbose=args.verbose)
     return run(apply=args.apply, report_path=args.report, offline=args.offline, verbose=args.verbose)
 
 
