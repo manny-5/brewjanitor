@@ -210,3 +210,43 @@ class TestPrereleaseNotice(unittest.TestCase):
     def test_an_unknown_answer_prints_nothing(self):
         # Never guess out loud: unknown is not the same as unsupported.
         self.assertEqual(self._notice(None), "")
+
+
+class TestFormulaeSubcommand(unittest.TestCase):
+    def test_it_parses_with_its_own_flags(self):
+        args = cli._build_parser().parse_args(["formulae", "--all", "--report", "f.csv", "--verbose"])
+        self.assertEqual(args.command, "formulae")
+        self.assertTrue(args.all and args.verbose)
+        self.assertEqual(args.report, "f.csv")
+
+    def test_defaults_are_narrow(self):
+        args = cli._build_parser().parse_args(["formulae"])
+        self.assertFalse(args.all)
+        self.assertIsNone(args.report)
+
+    def test_it_exposes_no_apply_flag(self):
+        # The read-only promise, enforced at the CLI boundary too.
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli._build_parser().parse_args(["formulae", "--apply"])
+
+    def test_it_routes_to_the_read_only_report(self):
+        with mock.patch.object(cli, "Brew", return_value=mock.Mock(available=True)), \
+             mock.patch("brewjanitor.binaries.report", return_value=0) as rep:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                code = cli.main(["formulae", "--all"])
+        self.assertEqual(code, 0)
+        rep.assert_called_once()
+        self.assertIs(rep.call_args.kwargs["all_path"], True)
+
+    def test_it_never_reaches_the_replace_pipeline(self):
+        with mock.patch.object(cli, "Brew", return_value=mock.Mock(available=True)), \
+             mock.patch("brewjanitor.binaries.report", return_value=0), \
+             mock.patch.object(cli, "replace") as replaced, \
+             mock.patch.object(cli, "inventory") as inv:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                cli.main(["formulae"])
+        replaced.assert_not_called()
+        inv.assert_not_called()

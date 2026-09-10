@@ -86,6 +86,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Also upgrade casks that auto-update themselves (may quit running apps).",
     )
     au.add_argument("--cleanup", action="store_true", help="Also run `brew cleanup`.")
+
+    formulae_desc = (
+        "Report which of your manually installed command-line tools Homebrew has "
+        "a formula for. READ-ONLY: this never installs and never deletes. Unlike "
+        "apps, a command-line tool has no bundle identifier to match on and "
+        "Homebrew installs into its own prefix, so an automatic 'replacement' "
+        "would leave two copies on disk with PATH order deciding which one runs. "
+        "You get the list; the decision stays yours."
+    )
+    fm = sub.add_parser("formulae", help=formulae_desc, description=formulae_desc)
+    fm.add_argument(
+        "--report",
+        metavar="PATH",
+        default=None,
+        help="Also write the matching tools to this CSV path.",
+    )
+    fm.add_argument(
+        "--all",
+        action="store_true",
+        help="Sweep every directory on PATH instead of just the usual "
+        "manual-install locations (/usr/local/bin, /usr/local/sbin, ~/bin, "
+        "~/.local/bin). Same filtering applies.",
+    )
+    fm.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print per-tool progress as the search runs.",
+    )
     return parser
 
 
@@ -264,6 +292,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if getattr(args, "command", None) == "autoupdate":
         return _run_autoupdate(args)
+    if getattr(args, "command", None) == "formulae":
+        from . import binaries as _bin
+
+        brew = Brew()
+        _note_prerelease_macos(brew, apply=False)
+        return _bin.report(
+            brew,
+            all_path=args.all,
+            report_path=args.report,
+            progress=args.verbose,
+        )
     if args.reconcile:
         return _run_reconcile(apply=args.apply, verbose=args.verbose)
     return run(apply=args.apply, report_path=args.report, offline=args.offline, verbose=args.verbose)

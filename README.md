@@ -229,7 +229,10 @@ brewjanitor is built in stages, each safe to run on its own:
    the old bundle is left untouched.
 5. **Report** (`report.py`) — writes the couldn't-be-replaced apps to a CSV.
 6. **CLI** (`cli.py`) — wires it all together behind the `brewjanitor` command,
-   plus an `autoupdate` subcommand (see below) for scheduled upgrades.
+   plus an `autoupdate` subcommand (see below) for scheduled upgrades and a
+   `formulae` subcommand for the read-only command-line-tool survey.
+7. **Binaries** (`binaries.py`) — the formula-side survey. Report-only by
+   design: it never installs and never deletes. Read-only.
 
 You can also run any piece directly, e.g.:
 
@@ -238,6 +241,59 @@ python3 -m brewjanitor.inventory      # just list apps
 python3 -m brewjanitor.brewcheck     # which does Homebrew manage
 python3 -m brewjanitor.brewsearch    # which could Homebrew install
 ```
+
+---
+
+## Command-line tools (`brewjanitor formulae`)
+
+```bash
+brewjanitor formulae                    # report only; changes nothing
+brewjanitor formulae --report tools.csv # also write the list to a CSV
+brewjanitor formulae --all              # sweep every directory on PATH
+```
+
+Reports which of your manually installed command-line tools Homebrew has a
+formula for. **It never installs and never deletes**, and there is no flag that
+makes it.
+
+That asymmetry with the app pipeline is deliberate. Replacing an app is safe
+because three things line up: an app has a `CFBundleIdentifier` that Homebrew
+records, a cask maps to exactly one `.app`, and `--adopt` lets brew take
+ownership of the bundle already on disk. None of that holds for formulae:
+
+- A command-line tool has **no identity**. A file named `python3` is just a
+  name, and name matching is exactly what produced the `R.app` → `r` false
+  match the cask path had to stop making.
+- A formula owns **hundreds of files** across `bin/`, `lib/`, `include/` and
+  `share/`, so "replace this binary" is not a well-defined operation.
+- There is **no `--adopt` for formulae**. Homebrew installs into its own prefix,
+  so a "replacement" would leave both copies on disk with `PATH` order silently
+  deciding which one runs.
+
+So it reports, and you decide. The output ends with the exact `brew install`
+commands, to run yourself if you want them.
+
+### What gets filtered out
+
+A raw listing of `PATH` is almost entirely things that are already managed, so
+the filtering is most of the value. Ruled out automatically:
+
+| Rule | Why |
+|---|---|
+| Already inside Homebrew's prefix | brew manages it already |
+| Under `/usr/bin`, `/System`, … | part of macOS |
+| Resolves into a `.app` or `.framework` | belongs to a GUI app — that's the cask pipeline's business |
+| Under `.pyenv`, `.nvm`, `.cargo`, `conda`, … | a version manager is deliberately managing it |
+| Broken symlink | points at nothing |
+
+A non-standard directory holding more than 25 executables is reported as one
+line rather than 25 candidates, since that is one installed product (a
+scientific suite, a vendored toolchain) rather than that many separate tools.
+
+On the development machine this took a `--all` sweep from 838 raw executables
+down to zero false candidates: 1266 macOS files, 473 Homebrew-owned, 52 from a
+version manager, 17 app shims, and one 387-binary product tree collapsed to a
+single line.
 
 ---
 

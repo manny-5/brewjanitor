@@ -76,6 +76,7 @@ class Brew:
         self._info_any_cache: dict[str, dict | None] = {}
         self._search_cache: dict[str, list[str]] = {}
         self._prerelease: bool | None | str = "unknown"
+        self._prefix: str | None = None
 
     def _env(self, read_only: bool) -> dict[str, str]:
         """Environment for a brew subprocess.
@@ -314,6 +315,20 @@ class Brew:
         names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         self._search_cache[key] = names
         return names
+
+    def prefix(self) -> str:
+        """Homebrew's install prefix (e.g. /opt/homebrew), or "" if unknown.
+
+        Used to recognise files Homebrew already owns. Cached for the life of
+        the wrapper; the prefix cannot change mid-run.
+        """
+        if self._prefix is None:
+            self._prefix = ""
+            if self.available:
+                result = self._run(["--prefix"], timeout=BREW_TIMEOUT)
+                if result.returncode == 0:
+                    self._prefix = result.stdout.strip()
+        return self._prefix
 
     def search_casks(self, term: str) -> list[str]:
         """Cask names matching `term`, one per line, no headers. Cached."""
