@@ -81,16 +81,28 @@ brewjanitor --apply
 
 For each app that Homebrew can install, this will:
 
-1. **install** it via Homebrew,
+1. run `brew install --cask --adopt <name>`,
 2. **verify** the install actually placed a matching app (by bundle id or
    `.app` name),
-3. **only then** remove the old bundle.
+3. **only then**, and only if Homebrew installed a *separate* copy somewhere
+   else, remove the old bundle.
+
+`--adopt` is what makes this work. Your unmanaged app sits on exactly the path
+the cask installs to, and a plain `brew install --cask` refuses to overwrite it.
+With `--adopt`, Homebrew checks that the bundle already on disk matches the cask
+and takes ownership of it **in place** — so the usual outcome deletes nothing at
+all. The removal step only runs in the genuine leftover case: your copy is in
+`~/Applications` while the cask installs to `/Applications`.
 
 If an install or a verification fails, the old app is **left untouched**. It
 also refuses to remove anything outside `/Applications` or `~/Applications`.
 
-> ⚠️ `--apply` changes your system (runs `brew install` and deletes old `.app`
-> bundles). Read the dry-run output first.
+One limitation worth knowing: Homebrew will only adopt a bundle whose version
+matches the cask's current version. If yours is out of date, the adopt fails
+with a message telling you to update the app first, and nothing is changed.
+
+> ⚠️ `--apply` changes your system (it runs `brew install`, and in the leftover
+> case deletes an old `.app` bundle). Read the dry-run output first.
 
 ### Fast check (no network)
 
@@ -124,6 +136,11 @@ the *old* bundle is still on disk at a different path, and removes only the old
 bundle. It **never re-installs** anything — it's a pure cleanup of a leftover.
 The same path guard applies (only removes inside `/Applications` or
 `~/Applications`).
+
+Matching is on **bundle identifier only**, never on the `.app` filename. Two
+apps sharing a name are not the same app: if you keep a beta or a pinned old
+build in `~/Applications` alongside a cask-installed copy in `/Applications`,
+a filename rule would call your second copy a leftover and delete it.
 
 ---
 
@@ -199,15 +216,23 @@ brewjanitor is built in stages, each safe to run on its own:
 2. **Brew check** (`brewcheck.py`) — labels each app as Homebrew-managed or not,
    using `brew info --json=v2 --installed` to map brew items to the `.app` paths
    they own. Read-only.
-3. **Brew search** (`brewsearch.py`) — for each unmanaged app, runs `brew search`
-   to decide whether Homebrew *could* install it. A dry run matches by name
+3. **Brew search** (`brewsearch.py`) — for each unmanaged app, runs
+   `brew search --casks` to decide whether Homebrew *could* install it. The
+   `--casks` scope matters: an unscoped `brew search` groups results under
+   `==> Formulae` / `==> Casks` headers that brew prints only to a terminal, so
+   parsing them from a pipe silently classified every cask as a formula.
+   Casks only — a formula never provides a `.app`. A dry run matches by name
    (fast, no `brew info`); verification happens only under `--apply`. Read-only.
 4. **Replace** (`replace.py`) — the only step that mutates. Under `--apply` it
-   installs the brew item, verifies the install, then removes the old bundle. On
-   any failure the old bundle is left untouched.
+   runs `brew install --cask --adopt`, verifies the install, and removes the old
+   bundle only if Homebrew installed a separate copy elsewhere. On any failure
+   the old bundle is left untouched.
 5. **Report** (`report.py`) — writes the couldn't-be-replaced apps to a CSV.
 6. **CLI** (`cli.py`) — wires it all together behind the `brewjanitor` command,
-   plus an `autoupdate` subcommand (see below) for scheduled upgrades.
+   plus an `autoupdate` subcommand (see below) for scheduled upgrades and a
+   `formulae` subcommand for the read-only command-line-tool survey.
+7. **Binaries** (`binaries.py`) — the formula-side survey. Report-only by
+   design: it never installs and never deletes. Read-only.
 
 You can also run any piece directly, e.g.:
 
@@ -216,6 +241,107 @@ python3 -m brewjanitor.inventory      # just list apps
 python3 -m brewjanitor.brewcheck     # which does Homebrew manage
 python3 -m brewjanitor.brewsearch    # which could Homebrew install
 ```
+
+---
+
+## Command-line tools (`brewjanitor formulae`)
+
+```bash
+brewjanitor formulae                    # report only; changes nothing
+brewjanitor formulae --report tools.csv # also write the list to a CSV
+brewjanitor formulae --all              # sweep every directory on PATH
+```
+
+Reports which of your manually installed command-line tools Homebrew has a
+formula for. **It never installs and never deletes**, and there is no flag that
+makes it.
+
+That asymmetry with the app pipeline is deliberate. Replacing an app is safe
+because three things line up: an app has a `CFBundleIdentifier` that Homebrew
+records, a cask maps to exactly one `.app`, and `--adopt` lets brew take
+ownership of the bundle already on disk. None of that holds for formulae:
+
+- A command-line tool has **no identity**. A file named `python3` is just a
+  name, and name matching is exactly what produced the `R.app` → `r` false
+  match the cask path had to stop making.
+- A formula owns **hundreds of files** across `bin/`, `lib/`, `include/` and
+  `share/`, so "replace this binary" is not a well-defined operation.
+- There is **no `--adopt` for formulae**. Homebrew installs into its own prefix,
+  so a "replacement" would leave both copies on disk with `PATH` order silently
+  deciding which one runs.
+
+So it reports, and you decide. The output ends with the exact `brew install`
+commands, to run yourself if you want them.
+
+### What gets filtered out
+
+A raw listing of `PATH` is almost entirely things that are already managed, so
+the filtering is most of the value. Ruled out automatically:
+
+| Rule | Why |
+|---|---|
+| Already inside Homebrew's prefix | brew manages it already |
+| Under `/usr/bin`, `/System`, … | part of macOS |
+| Resolves into a `.app` or `.framework` | belongs to a GUI app — that's the cask pipeline's business |
+| Under `.pyenv`, `.nvm`, `.cargo`, `conda`, … | a version manager is deliberately managing it |
+| Broken symlink | points at nothing |
+
+A non-standard directory holding more than 25 executables is reported as one
+line rather than 25 candidates, since that is one installed product (a
+scientific suite, a vendored toolchain) rather than that many separate tools.
+
+On the development machine this took a `--all` sweep from 838 raw executables
+down to zero false candidates: 1266 macOS files, 473 Homebrew-owned, 52 from a
+version manager, 17 app shims, and one 387-binary product tree collapsed to a
+single line.
+
+---
+
+## Running on a pre-release macOS
+
+Homebrew prints `We do not provide support for this pre-release version` when
+you are on a developer beta. brewjanitor detects this (it asks Homebrew itself,
+rather than keeping a version table that would go stale every autumn) and says
+so once at the top of a run.
+
+The warning is broader than its actual effect here:
+
+- **Casks are unaffected.** A cask ships a prebuilt `.app`; it does not depend
+  on the OS build. `brew search --casks`, `brew info --json=v2` and cask
+  installs were all checked on a beta and behave identically, with clean stdout
+  and no warning.
+- **Formulae are the part that a beta breaks** — they are built per-OS, and
+  bottles for a brand-new major version often do not exist yet, so brew warns
+  and may build from source. brewjanitor installs no formulae, which is why the
+  warning does not apply to it.
+
+Two related hardening measures, useful on a beta and harmless otherwise:
+
+- Read-only calls run with `HOMEBREW_NO_AUTO_UPDATE=1`, so a long scan cannot
+  stall partway through on an unannounced `brew update`. Installs keep
+  auto-update, since they genuinely want fresh cask metadata.
+- Under `--apply`, brew's output is **shown, not swallowed**. Previously both
+  streams were captured, so a cask whose installer asks for a password looked
+  like a hang — the prompt went into a pipe nobody displayed. stdout and stdin
+  are now inherited and stderr is teed, so you see warnings and progress live
+  and can still get a parsed reason if something fails.
+
+---
+
+## Tests
+
+The suite is stdlib `unittest` — no dependencies to install, nothing on disk is
+touched, and no `brew` is required (the command line is faked, and the removal
+step is injected).
+
+```bash
+python3 -m unittest discover -s tests -t .
+```
+
+The destructive paths carry the most coverage. Every test that exercises
+`--apply` or `--reconcile` injects a recording stub in place of the real
+remover, so a regression shows up as an unexpected call rather than as a
+deleted application.
 
 ---
 

@@ -18,8 +18,7 @@ This module only manages the scheduled job. It does not itself run upgrades.
 
 from __future__ import annotations
 
-import dataclasses
-import os
+import argparse
 import plistlib
 import shutil
 import subprocess

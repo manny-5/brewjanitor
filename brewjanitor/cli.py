@@ -86,12 +86,71 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Also upgrade casks that auto-update themselves (may quit running apps).",
     )
     au.add_argument("--cleanup", action="store_true", help="Also run `brew cleanup`.")
+
+    formulae_desc = (
+        "Report which of your manually installed command-line tools Homebrew has "
+        "a formula for. READ-ONLY: this never installs and never deletes. Unlike "
+        "apps, a command-line tool has no bundle identifier to match on and "
+        "Homebrew installs into its own prefix, so an automatic 'replacement' "
+        "would leave two copies on disk with PATH order deciding which one runs. "
+        "You get the list; the decision stays yours."
+    )
+    fm = sub.add_parser("formulae", help=formulae_desc, description=formulae_desc)
+    fm.add_argument(
+        "--report",
+        metavar="PATH",
+        default=None,
+        help="Also write the matching tools to this CSV path.",
+    )
+    fm.add_argument(
+        "--all",
+        action="store_true",
+        help="Sweep every directory on PATH instead of just the usual "
+        "manual-install locations (/usr/local/bin, /usr/local/sbin, ~/bin, "
+        "~/.local/bin). Same filtering applies.",
+    )
+    fm.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print per-tool progress as the search runs.",
+    )
     return parser
+
+
+def _note_prerelease_macos(brew: Brew, apply: bool) -> None:
+    """Say once, up front, that Homebrew considers this macOS unsupported.
+
+    Worth stating plainly because the consequences are narrower than the
+    warning sounds, and silence would leave brew's own warning (which only
+    appears on install, and only on stderr) to arrive unexplained mid-run.
+
+    Casks are unaffected: they ship prebuilt applications that do not depend on
+    the OS build, and `brew search --casks`, `brew info --json` and cask
+    installs were all verified to behave identically here. What a pre-release
+    macOS does change is *formulae*, which are built per-OS -- and brewjanitor
+    does not install formulae.
+    """
+    if brew.prerelease_macos() is not True:
+        return
+    print(
+        "Note: Homebrew considers this macOS a pre-release and does not support it.\n"
+        "      This does not affect brewjanitor: it installs casks, which are\n"
+        "      prebuilt apps and OS-independent. (Formulae are built per-OS and\n"
+        "      would be the part affected -- brewjanitor installs none.)",
+        file=sys.stderr,
+    )
+    if apply:
+        print(
+            "      brew may print its own pre-release warning during --apply; that is\n"
+            "      expected, and brew's output is shown to you in full.",
+            file=sys.stderr,
+        )
 
 
 def run(apply: bool, report_path: str | None, offline: bool = False, verbose: bool = False) -> int:
     """Run the full pipeline. Returns a process exit code."""
     brew = Brew()
+    _note_prerelease_macos(brew, apply)
     if not brew.available:
         print(
             "brew not found on PATH; install Homebrew first (https://brew.sh).",
@@ -233,6 +292,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if getattr(args, "command", None) == "autoupdate":
         return _run_autoupdate(args)
+    if getattr(args, "command", None) == "formulae":
+        from . import binaries as _bin
+
+        brew = Brew()
+        _note_prerelease_macos(brew, apply=False)
+        return _bin.report(
+            brew,
+            all_path=args.all,
+            report_path=args.report,
+            progress=args.verbose,
+        )
     if args.reconcile:
         return _run_reconcile(apply=args.apply, verbose=args.verbose)
     return run(apply=args.apply, report_path=args.report, offline=args.offline, verbose=args.verbose)

@@ -1,4 +1,4 @@
-"""Piece 4 — replace: install via brew FIRST, verify, then remove the old bundle.
+"""Piece 4 — replace: hand an app over to Homebrew, preferring adoption.
 
 This is the only piece that mutates the system. Safety model:
 
@@ -6,13 +6,22 @@ This is the only piece that mutates the system. Safety model:
     each installable candidate but changes nothing.
   * The destructive path is only entered when `apply=True`. Even then the
     install-before-delete order is mandatory:
-      1. install the brew item,
+      1. `brew install --cask --adopt <name>`,
       2. verify the brew install actually placed an .app that matches the
          original by bundle_id (or, failing that, by .app path),
-      3. only if verification succeeds, remove the original bundle from disk.
+      3. only if verification succeeds -- AND brew installed a separate copy
+         somewhere else -- remove the original bundle from disk.
   * If the install or the verification fails, the original bundle is left
     untouched and the candidate is reported as `failed` (with a reason). We
     never delete first.
+
+`--adopt` is central. An unmanaged app in /Applications occupies exactly the
+path its cask installs to, and a plain `brew install --cask` refuses to
+overwrite it, so the pre-adopt version of this module failed at step 1 for every
+app it was designed to handle. Adoption also means the usual outcome deletes
+NOTHING: brew takes ownership of the bundle already on disk. The rmtree path
+below now only runs for the genuine leftover case (original in ~/Applications,
+cask installed to /Applications).
 
 Removing a bundle uses shutil.rmtree on the bundle directory. We refuse to
 remove any path outside the configured scan directories (DEFAULT_SCAN_DIRS) as
@@ -26,6 +35,7 @@ swap it out.
 from __future__ import annotations
 
 import dataclasses
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -55,26 +65,51 @@ class ReplaceResult:
 
 
 def _is_safe_to_remove(app_path: str, allowed_roots: tuple[str, ...]) -> bool:
-    """True only if app_path resolves inside one of the allowed scan roots.
+    """True only if app_path is a .app bundle strictly inside an allowed root.
 
-    This guards against deleting a bundle that lives somewhere unexpected
-    (e.g. a path crafted to escape /Applications). We resolve both sides so a
-    symlinked /Applications is still treated as allowed.
+    This is the last line of defence before an rmtree, so it is deliberately
+    strict on three counts:
+
+    * The path must end in `.app`. We only ever delete app bundles.
+    * It must be a *strict descendant* of a root, never the root itself.
+      `Path.relative_to` succeeds when the two paths are equal, so the earlier
+      version returned True for "/Applications" -- i.e. it would have approved
+      deleting the entire scan root.
+    * BOTH the literal path and its symlink-resolved form must be inside an
+      allowed root. Checking only the resolved form let a bundle be approved on
+      the strength of where it points while rmtree acted on where it sits (and
+      vice versa); requiring both closes that gap.
     """
-    target = Path(app_path).resolve(strict=False)
-    for root in allowed_roots:
-        try:
-            root_resolved = Path(root).resolve(strict=False)
-            target.relative_to(root_resolved)
+    literal = Path(os.path.abspath(app_path))
+    resolved = Path(app_path).resolve(strict=False)
+    if literal.suffix.lower() != ".app" or resolved.suffix.lower() != ".app":
+        return False
+
+    def _inside(target: Path) -> bool:
+        for root in allowed_roots:
+            try:
+                root_resolved = Path(root).resolve(strict=False)
+            except OSError:
+                continue
+            if target == root_resolved:
+                return False  # the root itself is never removable
+            try:
+                target.relative_to(root_resolved)
+            except ValueError:
+                continue
             return True
-        except ValueError:
-            continue
-    return False
+        return False
+
+    return _inside(literal) and _inside(resolved)
 
 
 def _remove_bundle(app_path: str) -> tuple[bool, str]:
     """Delete a .app bundle directory. Returns (success, reason)."""
     path = Path(app_path)
+    if path.is_symlink():
+        # Ambiguous: deleting the link leaves the real bundle, and deleting the
+        # target leaves a dangling link. Refuse rather than guess.
+        return False, f"refusing to remove a symlinked bundle: {app_path}"
     if not path.exists():
         return False, f"bundle not found: {app_path}"
     if not path.is_dir():
@@ -100,9 +135,9 @@ def reconcile(
     the brew-managed app and the original bundle on disk. A normal re-run would
     see the original as "unmanaged" and try to install it again -- wasteful and
     confusing. This instead detects the orphan: an app that is NOT brew-managed
-    (the old copy) but where brew now manages a cask whose artifact matches the
-    same bundle_id or .app basename, and removes ONLY the old bundle (no
-    re-install). It is a pure cleanup of a leftover, never a fresh install.
+    (the old copy) but where brew now manages a cask declaring the same
+    bundle_id, and removes ONLY the old bundle (no re-install). It is a pure
+    cleanup of a leftover, never a fresh install.
 
     Safety mirrors replace(): dry-run by default (prints what it would remove),
     the path guard applies, and removal is the only mutation.
@@ -118,9 +153,9 @@ def reconcile(
             for a in apps
         ]
 
-    by_path, by_basename = _build_brew_ownership(brew)
+    by_path, _ = _build_brew_ownership(brew)
 
-    # Map bundle_id -> brew_name for casks that report one, and basename -> name.
+    # Map bundle_id -> brew_name for every installed cask that reports one.
     by_bundle_id: dict[str, str] = {}
     for cask in brew.info_installed_all(is_cask=True):
         token = cask.get("token") or cask.get("full_name") or cask.get("name") or ""
@@ -144,18 +179,27 @@ def reconcile(
             )
             continue
 
-        # Does brew now manage a cask matching this app's bundle_id or basename?
-        # (basename here is fine: it tells us a cask for this app name exists, so
-        # the old bundle is a leftover of that cask's install.)
+        # Does brew now manage a cask matching this app's bundle_id?
+        #
+        # Bundle id ONLY -- never the .app basename. A basename match says
+        # nothing more than "two files share a name": if a cask installed
+        # /Applications/Firefox.app and you separately keep
+        # ~/Applications/Firefox.app (a beta, or a pinned old version), a
+        # basename rule declares your second copy an orphan and deletes it.
+        # Worse, check() treats that same basename match as *managed, leave
+        # alone*, so the two halves of the tool disagreed about the same app.
+        # The bundle id is the identity brew itself records, so it is the only
+        # signal strong enough to justify an rmtree.
+        #
+        # An app with no bundle id (unreadable Info.plist) is never an orphan
+        # candidate -- we have nothing to match on, so we leave it alone.
         match_name = ""
         if a.bundle_id and a.bundle_id in by_bundle_id:
             match_name = by_bundle_id[a.bundle_id]
-        elif a.name and a.name.lower() in by_basename:
-            match_name = by_basename[a.name.lower()][0]
 
         if not match_name:
             results.append(
-                ReplaceResult(app=a, brew_name="", brew_kind="", status="skipped", reason="no brew cask owns this app; not an orphan")
+                ReplaceResult(app=a, brew_name="", brew_kind="", status="skipped", reason="no brew cask owns this bundle id; not an orphan")
             )
             continue
 
@@ -187,45 +231,80 @@ def _normalize_path(path: str) -> str:
     try:
         return str(Path(path).resolve(strict=False))
     except OSError:
-        import os
         return os.path.normpath(path)
+
+
+def _owned_app_paths(info: dict) -> list[str]:
+    """Absolute, normalized .app paths an installed cask now owns.
+
+    Used to tell an *adopted in place* install (brew took ownership of the very
+    bundle we started from) apart from a *fresh* install elsewhere (which leaves
+    the original as a leftover we should clean up).
+    """
+    from .brewcheck import _cask_appdir_one, _cask_artifact_names, _resolve_artifact
+
+    owned: list[str] = []
+    for cask in info.get("casks", []):
+        appdir = _cask_appdir_one(cask)
+        for raw in _cask_artifact_names(cask):
+            owned.append(_normalize_path(_resolve_artifact(raw, appdir)))
+    return owned
 
 
 def _verify_install(
     app: App, brew: Brew, brew_name: str, is_cask: bool
-) -> tuple[bool, str]:
+) -> tuple[bool, str, list[str]]:
     """Check that the brew install actually placed the expected app.
 
     We re-read `brew info --json=v2 --installed <name>` and look for an installed
     artifact whose bundle_id matches the original app's bundle_id, or whose .app
     filename matches the original. A match means brew now owns an equivalent
-    app, so it is safe to remove the old bundle.
+    app.
+
+    Returns (ok, reason, owned_paths) -- owned_paths lets the caller decide
+    whether the original bundle IS the adopted one (nothing to remove) or a
+    separate leftover copy.
     """
     if not app.bundle_id and not app.name:
-        return False, "no bundle id or name to verify against"
+        return False, "no bundle id or name to verify against", []
     info = brew.info_json(brew_name, is_cask=is_cask)
     if not info:
-        return False, f"brew info returned nothing for {brew_name}"
+        return False, f"brew info returned nothing for {brew_name}", []
 
-    candidates: list[tuple[str, str]] = []
-    if is_cask:
-        from .brewsearch import _cask_app_artifacts
+    if not is_cask:
+        # Apps come from casks, not formulae. brewsearch no longer proposes
+        # formula candidates at all, but this stays as a backstop: we cannot
+        # confirm a formula placed a matching .app, and no verified match means
+        # no delete.
+        return False, "formula installs are not auto-replaced (apps come from casks)", []
 
-        candidates = _cask_app_artifacts(info)
-    else:
-        # Apps come from casks, not formulae. A formula candidate is almost
-        # always a mislabelled cask (see the brew-search header bug). We refuse
-        # to delete the original bundle for a formula "install", because we
-        # cannot confirm a formula placed a matching .app. This keeps the
-        # install-before-delete guarantee honest: no verified match, no delete.
-        return False, "formula installs are not auto-replaced (apps come from casks)"
+    from .brewsearch import _cask_app_artifacts
 
-    for art_path, bid in candidates:
+    owned = _owned_app_paths(info)
+    for art_path, bid in _cask_app_artifacts(info):
         if app.bundle_id and bid and bid == app.bundle_id:
-            return True, f"bundle id matches: {bid}"
+            return True, f"bundle id matches: {bid}", owned
         if Path(art_path).name.lower() == app.name.lower():
-            return True, f"app path matches: {art_path}"
-    return False, "installed artifact did not match original app"
+            return True, f"app path matches: {art_path}", owned
+    return False, "installed artifact did not match original app", owned
+
+
+def _install_failure_reason(stderr: str) -> str:
+    """Turn a brew install failure into something the user can act on.
+
+    The one worth naming is the --adopt version mismatch: brew will only adopt
+    an existing bundle whose version matches the cask's current version, so an
+    out-of-date app fails with a message that does not, on its own, suggest a
+    remedy.
+    """
+    err = (stderr or "").strip()
+    if "is different from the one being installed" in err:
+        return (
+            "cannot adopt: the installed app's version differs from the cask's. "
+            "Update the app to the current version (or move it aside) and re-run, "
+            "so brew can take ownership of it"
+        )
+    return f"install failed: {err[:200]}"
 
 
 def replace(
@@ -289,16 +368,23 @@ def replace(
                     brew_kind=cand.brew_kind,
                     status="dry-run",
                     reason=(
-                        f"would `brew install {'--cask ' if cand.brew_kind=='cask' else ''}"
-                        f"{cand.brew_name}`, verify, then remove {cand.app.path}"
+                        f"would `brew install --cask --adopt {cand.brew_name}` so brew "
+                        f"takes ownership of {cand.app.path} in place (only removing it "
+                        f"if brew installs a separate copy elsewhere)"
                     ),
                 )
             )
             continue
 
         # --- apply path ---
+        # `--adopt` is what makes this reachable at all. An unmanaged app in
+        # /Applications sits on exactly the path the cask installs to, and a
+        # plain `brew install --cask` refuses to overwrite it ("It seems there
+        # is already an App at ..."), so the old code failed here every time for
+        # the apps it was built to handle. With --adopt, brew verifies the
+        # existing bundle matches the cask and takes ownership in place.
         is_cask = cand.brew_kind == "cask"
-        install = brew.install(cand.brew_name, is_cask=is_cask)
+        install = brew.install(cand.brew_name, is_cask=is_cask, adopt=is_cask)
         if install.returncode != 0:
             results.append(
                 ReplaceResult(
@@ -306,12 +392,12 @@ def replace(
                     brew_name=cand.brew_name,
                     brew_kind=cand.brew_kind,
                     status="failed",
-                    reason=f"install failed: {install.stderr.strip()[:200]}",
+                    reason=_install_failure_reason(install.stderr),
                 )
             )
             continue
 
-        ok, why = _verify_install(cand.app, brew, cand.brew_name, is_cask=is_cask)
+        ok, why, owned = _verify_install(cand.app, brew, cand.brew_name, is_cask=is_cask)
         if not ok:
             results.append(
                 ReplaceResult(
@@ -324,6 +410,24 @@ def replace(
             )
             continue
 
+        # Adopted in place: brew now owns the very bundle we started from, so
+        # there is nothing left to delete. This is the common, and by far the
+        # safest, outcome -- the whole rmtree path below is skipped.
+        if _normalize_path(cand.app.path) in owned:
+            results.append(
+                ReplaceResult(
+                    app=cand.app,
+                    brew_name=cand.brew_name,
+                    brew_kind=cand.brew_kind,
+                    status="replaced",
+                    reason=f"brew now manages {cand.app.path} as {cand.brew_name} (adopted in place; nothing removed)",
+                )
+            )
+            continue
+
+        # Otherwise brew installed a fresh copy somewhere else (typically the
+        # original lives in ~/Applications while the cask installs to
+        # /Applications), so the original really is a leftover.
         if not _is_safe_to_remove(cand.app.path, roots):
             results.append(
                 ReplaceResult(

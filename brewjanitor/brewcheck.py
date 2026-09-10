@@ -36,6 +36,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .inventory import App
+
 # How long a single read-only brew call may take before we give up and treat it
 # as failed. Keeps a hung tap fetch from hanging the whole tool forever.
 BREW_TIMEOUT = 60.0
@@ -73,6 +75,48 @@ class Brew:
         # the single biggest speedup for a 40-app scan.
         self._info_any_cache: dict[str, dict | None] = {}
         self._search_cache: dict[str, list[str]] = {}
+        self._prerelease: bool | None | str = "unknown"
+        self._prefix: str | None = None
+
+    def _env(self, read_only: bool) -> dict[str, str]:
+        """Environment for a brew subprocess.
+
+        HOMEBREW_NO_ENV_HINTS everywhere: the hints are chatty, they land on
+        stderr, and stderr is where we look for the *actual* error.
+
+        HOMEBREW_NO_AUTO_UPDATE on read-only calls only. A scan makes many brew
+        calls in a row, and having one of them silently trigger a full `brew
+        update` mid-scan is a long unexplained stall. An install, by contrast,
+        genuinely wants fresh cask metadata, so auto-update is left alone there.
+        """
+        env = dict(os.environ)
+        env["HOMEBREW_NO_ENV_HINTS"] = "1"
+        if read_only:
+            env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+        return env
+
+    def prerelease_macos(self) -> bool | None:
+        """True if Homebrew considers this macOS a pre-release, None if unknown.
+
+        Asked of Homebrew itself rather than derived from a version table here:
+        brew already knows which macOS versions it supports, and that list moves
+        every autumn. `brew doctor` is the only ordinary command that surfaces
+        the warning, and it is far too slow to run for this, so we query the
+        same underlying predicate directly. Cached; roughly half a second once.
+
+        Returns None (not False) when the question cannot be answered, so a
+        caller can distinguish "supported" from "could not tell".
+        """
+        if self._prerelease != "unknown":
+            return self._prerelease  # type: ignore[return-value]
+        self._prerelease = None
+        if self.available:
+            result = self._run(["ruby", "-e", "puts OS::Mac.version.prerelease?"], timeout=30.0)
+            if result.returncode == 0:
+                answer = result.stdout.strip().splitlines()
+                if answer and answer[-1].strip() in ("true", "false"):
+                    self._prerelease = answer[-1].strip() == "true"
+        return self._prerelease  # type: ignore[return-value]
 
     @property
     def available(self) -> bool:
@@ -86,6 +130,10 @@ class Brew:
         The timeout keeps a single hung brew call (e.g. a tap fetch stuck on a
         flaky network) from hanging the whole tool forever. A timed-out call
         returns a synthetic failure with a stderr note instead of raising.
+
+        Every failure mode is a return code, never an exception: a missing brew
+        binary, a permissions problem, or any other OSError would otherwise take
+        down a whole scan from inside a loop.
         """
         try:
             return subprocess.run(
@@ -95,14 +143,65 @@ class Brew:
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=timeout,
+                env=self._env(read_only=True),
             )
-        except subprocess.TimeoutExpired as exc:
+        except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(
                 args=[self._brew, *args],
                 returncode=124,
                 stdout="",
                 stderr=f"brew timed out after {timeout}s: {' '.join(args)}",
             )
+        except OSError as exc:
+            return subprocess.CompletedProcess(
+                args=[self._brew, *args],
+                returncode=127,
+                stdout="",
+                stderr=f"could not run brew: {exc}",
+            )
+
+    def _run_streaming(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        """Run a mutating brew command with its output VISIBLE to the user.
+
+        Installs are the one place where hiding brew's output is actively
+        harmful. Capturing both streams meant:
+
+          * a cask whose installer needs a password appeared to hang forever --
+            the prompt went into a pipe nobody displayed, while brew blocked on
+            stdin waiting for an answer;
+          * multi-minute downloads showed no progress at all;
+          * warnings brew emits on stderr (notably the pre-release macOS notice)
+            were never seen.
+
+        So stdout and stdin are inherited -- brew talks to the terminal directly
+        -- while stderr is *teed*: echoed through as it arrives and captured, so
+        a failure reason can still be parsed out of it afterwards.
+        """
+        argv = [self._brew, *args]
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=None,  # inherit: progress goes straight to the terminal
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=self._env(read_only=False),
+            )
+        except OSError as exc:
+            return subprocess.CompletedProcess(
+                args=argv, returncode=127, stdout="", stderr=f"could not run brew: {exc}"
+            )
+
+        captured: list[str] = []
+        if proc.stderr is not None:
+            for line in proc.stderr:
+                captured.append(line)
+                sys.stderr.write(line)
+                sys.stderr.flush()
+        proc.wait()
+        return subprocess.CompletedProcess(
+            args=argv, returncode=proc.returncode, stdout="", stderr="".join(captured)
+        )
 
     def list_formulae(self) -> list[str]:
         """Installed formulae by name. Empty if brew is unavailable."""
@@ -138,10 +237,7 @@ class Brew:
         )
         if result.returncode != 0 or not result.stdout.strip():
             return None
-        try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return None
+        return _loads_json(result.stdout)
 
     def info_installed_all(self, is_cask: bool) -> list[dict]:
         """Return the parsed `brew info --json=v2 --installed` payloads for ALL
@@ -161,9 +257,8 @@ class Brew:
         )
         if result.returncode != 0 or not result.stdout.strip():
             return []
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError:
+        payload = _loads_json(result.stdout)
+        if payload is None:
             return []
         key = "casks" if is_cask else "formulae"
         items = payload.get(key, [])
@@ -186,56 +281,80 @@ class Brew:
         if result.returncode != 0 or not result.stdout.strip():
             self._info_any_cache[name] = None
             return None
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError:
+        payload = _loads_json(result.stdout)
+        if payload is None:
             self._info_any_cache[name] = None
             return None
         self._info_any_cache[name] = payload
         return payload
 
-    def search(self, term: str) -> list[str]:
-        """Return brew search results (formula + cask names) for a term.
+    def _search_scoped(self, term: str, scope: str) -> list[str]:
+        """Return `brew search <scope> <term>` results as bare names.
 
-        `brew search` prints results grouped under `==>` section headers --
-        `==> Formulae` and `==> Casks` -- one name per line. We track the current
-        section and append ` (cask)` to every line found under `==> Casks`, so
-        callers can tell casks from formulae by the suffix. (Older/alternate
-        brew output sometimes already appends ` (cask)`; we don't double-tag.)
-        Results are cached per term. Empty if brew is unavailable or the search
-        fails.
+        Scope is "--casks" or "--formula". Scoping the search is what makes the
+        result unambiguous: brew prints one bare name per line with NO section
+        headers, so there is nothing to parse and no way to confuse a cask for a
+        formula. (The previous implementation parsed `==> Casks` headers out of
+        an unscoped `brew search`, but brew only emits those headers when stdout
+        is a TTY -- and we always capture through a pipe. Every cask therefore
+        looked like a formula. See search_casks/search_formulae.)
+
+        Results are cached per (term, scope). Empty if brew is unavailable or
+        the search fails -- note that brew exits non-zero when a search simply
+        has no matches, which is correctly reported here as "no candidates".
         """
         if not self.available:
             return []
-        if term in self._search_cache:
-            return self._search_cache[term]
-        result = self._run(["search", term], timeout=BREW_TIMEOUT)
+        key = f"{scope}\x00{term}"
+        if key in self._search_cache:
+            return self._search_cache[key]
+        result = self._run(["search", scope, term], timeout=BREW_TIMEOUT)
         if result.returncode != 0:
-            self._search_cache[term] = []
+            self._search_cache[key] = []
             return []
-        names: list[str] = []
-        in_casks = False
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("==>"):
-                in_casks = line.lower().endswith("casks")
-                continue
-            if in_casks and not line.endswith("(cask)"):
-                names.append(f"{line} (cask)")
-            else:
-                names.append(line)
-        self._search_cache[term] = names
+        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        self._search_cache[key] = names
         return names
+
+    def prefix(self) -> str:
+        """Homebrew's install prefix (e.g. /opt/homebrew), or "" if unknown.
+
+        Used to recognise files Homebrew already owns. Cached for the life of
+        the wrapper; the prefix cannot change mid-run.
+        """
+        if self._prefix is None:
+            self._prefix = ""
+            if self.available:
+                result = self._run(["--prefix"], timeout=BREW_TIMEOUT)
+                if result.returncode == 0:
+                    self._prefix = result.stdout.strip()
+        return self._prefix
+
+    def search_casks(self, term: str) -> list[str]:
+        """Cask names matching `term`, one per line, no headers. Cached."""
+        return self._search_scoped(term, "--casks")
+
+    def search_formulae(self, term: str) -> list[str]:
+        """Formula names matching `term`, one per line, no headers. Cached."""
+        return self._search_scoped(term, "--formula")
 
     # ------------------------------------------------------------------
     # Mutating operations. Unlike the read-only methods above, these change
     # the system. They MUST be gated behind an explicit user opt-in (the
     # --apply flag) by callers; the wrapper itself does not enforce that.
     # ------------------------------------------------------------------
-    def install(self, name: str, is_cask: bool) -> subprocess.CompletedProcess[str]:
+    def install(
+        self, name: str, is_cask: bool, adopt: bool = False
+    ) -> subprocess.CompletedProcess[str]:
         """Install a formula (`brew install`) or cask (`brew install --cask`).
+
+        `adopt` adds `--adopt`, which tells Homebrew to take ownership of an
+        .app that is ALREADY at the cask's install location instead of refusing
+        to overwrite it. This is essential for brewjanitor's whole purpose: an
+        unmanaged app in /Applications occupies exactly the path the cask wants,
+        so a plain `brew install --cask` always fails with "It seems there is
+        already an App at ...". With --adopt, brew verifies the existing bundle
+        matches the cask version and adopts it in place -- no delete required.
 
         This is a mutating operation: callers are responsible for only invoking
         it when the user has explicitly opted in (e.g. --apply). It returns the
@@ -243,7 +362,9 @@ class Brew:
         to decide whether the install actually succeeded.
         """
         args = ["install", "--cask", name] if is_cask else ["install", name]
-        return self._run(args)
+        if adopt and is_cask:
+            args.insert(1, "--adopt")
+        return self._run_streaming(args)
 
     def uninstall(self, name: str, is_cask: bool) -> subprocess.CompletedProcess[str]:
         """Uninstall a formula or cask. Mutating; caller-gated like install().
@@ -254,7 +375,30 @@ class Brew:
         completeness and rollback scenarios.
         """
         args = ["uninstall", "--cask", name] if is_cask else ["uninstall", name]
-        return self._run(args)
+        return self._run_streaming(args)
+
+
+def _loads_json(text: str) -> dict | None:
+    """Parse brew's JSON, tolerating a non-JSON preamble on stdout.
+
+    brew writes warnings to stderr today -- verified on this machine, including
+    the pre-release macOS notice -- so plain json.loads is the normal path. But
+    a pre-release OS is precisely where brew grows new output, and one stray
+    line prepended to stdout would otherwise turn a whole payload into "brew
+    returned nothing". Falling back to the first `{` costs nothing and fails
+    closed.
+    """
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    if start > 0:
+        try:
+            return json.loads(text[start:])
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
 def _normalize(path: str) -> str:
