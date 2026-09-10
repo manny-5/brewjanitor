@@ -107,11 +107,17 @@ Excel, PowerPoint, OneNote, Teams, Malwarebytes, NordVPN). For those, brew
 reports **no owned `.app` path**, so the verify step matches on the **bundle
 ids the cask names in its `uninstall`/`zap` directives** (e.g.
 `com.microsoft.Excel`, `com.nordvpn.macos`) against your app's
-`CFBundleIdentifier` — not on an `.app` filename. Because a pkg installer
-does not report a single install path, brewjanitor treats a verified pkg-cask
-install as **in place** and removes nothing (deleting the original would risk
-removing brew's own copy). The same bundle-id matching lets `--reconcile`
-detect a leftover old bundle from a pkg-cask install.
+`CFBundleIdentifier`.
+
+Because a pkg installer does not report a single install path, brewjanitor
+**never removes the original bundle for a pkg cask**, even when verification
+succeeds. A bundle-id match confirms brew manages an app of that identity, but
+it cannot prove the `.app` at the original path is a *separate* copy rather than
+the very one brew installed — deleting it would risk removing brew's own copy.
+So a verified pkg-cask install is reported as `replaced` (installed in place,
+nothing removed) and the removal path is skipped entirely. `--reconcile`
+applies the same rule: a bundle whose only match is a pkg cask is reported as
+`skipped` for manual inspection, never removed.
 
 > ⚠️ `--apply` changes your system (it runs `brew install`, and in the leftover
 > case deletes an old `.app` bundle). Read the dry-run output first.

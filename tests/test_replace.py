@@ -299,13 +299,35 @@ class TestReplaceApplyPkgCask(unittest.TestCase):
 
     def test_a_pkg_cask_in_place_removes_nothing(self):
         # The original .app in /Applications IS the brew-managed copy (a pkg
-        # installer lands there), so there is nothing to delete. An empty
-        # owned-path list must NOT fall through to removal for a pkg cask.
+        # installer lands there), so there is nothing to delete. A pkg cask must
+        # NEVER reach the remover regardless of owned paths.
         brew, remover = self._brew(), RecordingRemover()
         results = replace([self._candidate()], brew, apply=True, allowed_roots=ROOTS, remover=remover)
         self.assertEqual(results[0].status, "replaced")
-        self.assertIn("adopted in place", results[0].reason)
+        self.assertIn("nothing removed", results[0].reason)
         self.assertEqual(remover.calls, [])
+
+    def test_a_pkg_cask_never_reaches_the_remover_even_if_owned_differs(self):
+        # Regression for the data-loss bug: when brew's JSON for an installed
+        # pkg cask surfaces an owned .app path that does NOT match the original,
+        # the app-cask logic would treat the original as a separate leftover and
+        # rmtree it. For a pkg cask this is unsafe (the bundle-id match does not
+        # prove the original is a *separate* copy), so removal must be skipped
+        # unconditionally. Simulate the dangerous JSON shape: a pkg artifact
+        # AND an app artifact pointing elsewhere.
+        from tests.fakes import cask_info_pkg
+        info = cask_info_pkg("microsoft-excel", ["com.microsoft.Excel"])["casks"][0]
+        info["artifacts"].insert(0, {"app": ["/opt/homebrew/Caskroom/microsoft-excel/Excel.app"]})
+        brew = FakeBrew(
+            info_by_name={"microsoft-excel": {"casks": [info], "formulae": []}},
+            install_result=ok(),
+        )
+        remover = RecordingRemover()
+        cand = self._candidate(where="/Applications")
+        results = replace([cand], brew, apply=True, allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "replaced")
+        self.assertIn("nothing removed", results[0].reason)
+        self.assertEqual(remover.calls, [], "pkg cask must never reach the remover")
 
     def test_a_pkg_cask_install_requests_adoption(self):
         brew = self._brew()
@@ -426,52 +448,59 @@ class TestReconcile(unittest.TestCase):
 
 
 class TestReconcilePkgCask(unittest.TestCase):
-    """reconcile must detect orphans from pkg cask installs too. A pkg cask has
-    an empty bundle_identifier, so its identity lives in the uninstall/zap
-    directives; reconcile's bundle-id index must draw from those, not just from
-    bundle_identifier.
+    """reconcile must NEVER remove a bundle whose only match is a pkg cask. A
+    pkg cask does not report owned .app paths, so its brew-managed
+    /Applications install is indistinguishable from a genuine leftover by path;
+    a bundle-id match alone is not enough to justify an rmtree (it would
+    delete the managed copy). pkg-cask matches are reported as skipped for
+    manual inspection instead.
     """
 
     def _brew(self, token="microsoft-excel", bundle_id="com.microsoft.Excel"):
         from tests.fakes import cask_info_pkg
         return FakeBrew(installed_casks=cask_info_pkg(token, [bundle_id])["casks"])
 
-    def test_a_leftover_with_a_matching_pkg_cask_bundle_id_is_an_orphan(self):
+    def test_a_pkg_cask_match_is_skipped_not_removed(self):
+        # A bundle whose id matches a pkg cask: skipped, never removed, even
+        # under --apply. This is the data-loss guard.
         leftover = app(name="Microsoft Excel.app", bundle_id="com.microsoft.Excel",
                        where="/Users/tester/Applications")
         remover = RecordingRemover()
         results = reconcile([leftover], self._brew(), apply=True,
                             allowed_roots=ROOTS, remover=remover)
-        self.assertEqual(results[0].status, "replaced")
-        self.assertEqual(remover.calls, [leftover.path])
+        self.assertEqual(results[0].status, "skipped")
+        self.assertIn("pkg cask", results[0].reason)
+        self.assertEqual(remover.calls, [])
 
-    def test_a_pkg_cask_orphan_with_a_mismatched_bundle_id_is_not_removed(self):
-        # The leftover's bundle id is not among the cask's identities, so it is
-        # not an orphan -- do not delete it.
+    def test_a_pkg_cask_match_in_dry_run_is_skipped_not_dry_run(self):
+        # Even in dry-run, a pkg-cask match is skipped (not a "would remove"
+        # dry-run line), so the user is not told brewjanitor would delete it.
+        leftover = app(name="Microsoft Excel.app", bundle_id="com.microsoft.Excel",
+                       where="/Users/tester/Applications")
+        remover = RecordingRemover()
+        results = reconcile([leftover], self._brew(), apply=False,
+                            allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "skipped")
+        self.assertEqual(remover.calls, [])
+
+    def test_a_pkg_cask_match_outside_allowed_roots_is_still_skipped(self):
+        # The pkg-cask guard fires before the path guard; either way nothing is
+        # removed.
+        stray = app(name="Microsoft Excel.app", bundle_id="com.microsoft.Excel",
+                    where="/Users/tester/Desktop")
+        remover = RecordingRemover()
+        results = reconcile([stray], self._brew(), apply=True,
+                            allowed_roots=ROOTS, remover=remover)
+        self.assertEqual(results[0].status, "skipped")
+        self.assertEqual(remover.calls, [])
+
+    def test_a_mismatched_bundle_id_is_not_an_orphan(self):
         leftover = app(name="Microsoft Excel.app", bundle_id="com.totally.different",
                        where="/Users/tester/Applications")
         remover = RecordingRemover()
         results = reconcile([leftover], self._brew(), apply=True,
                             allowed_roots=ROOTS, remover=remover)
         self.assertEqual(results[0].status, "skipped")
-        self.assertEqual(remover.calls, [])
-
-    def test_a_pkg_cask_orphan_outside_the_allowed_roots_is_refused(self):
-        stray = app(name="Microsoft Excel.app", bundle_id="com.microsoft.Excel",
-                    where="/Users/tester/Desktop")
-        remover = RecordingRemover()
-        results = reconcile([stray], self._brew(), apply=True,
-                            allowed_roots=ROOTS, remover=remover)
-        self.assertEqual(results[0].status, "failed")
-        self.assertEqual(remover.calls, [])
-
-    def test_a_pkg_cask_orphan_is_reported_in_dry_run_without_removing(self):
-        leftover = app(name="Microsoft Excel.app", bundle_id="com.microsoft.Excel",
-                       where="/Users/tester/Applications")
-        remover = RecordingRemover()
-        results = reconcile([leftover], self._brew(), apply=False,
-                            allowed_roots=ROOTS, remover=remover)
-        self.assertEqual(results[0].status, "dry-run")
         self.assertEqual(remover.calls, [])
 
 
