@@ -197,11 +197,13 @@ class Brew:
     def search(self, term: str) -> list[str]:
         """Return brew search results (formula + cask names) for a term.
 
-        `brew search` is read-only: it queries local taps and prints matching
-        formula/cask names, one per line, with casks suffixed ` (cask)`. We strip
-        that suffix to return bare names. Results are cached per term so two apps
-        that derive the same search term share one brew call. Empty if brew is
-        unavailable.
+        `brew search` prints results grouped under `==>` section headers --
+        `==> Formulae` and `==> Casks` -- one name per line. We track the current
+        section and append ` (cask)` to every line found under `==> Casks`, so
+        callers can tell casks from formulae by the suffix. (Older/alternate
+        brew output sometimes already appends ` (cask)`; we don't double-tag.)
+        Results are cached per term. Empty if brew is unavailable or the search
+        fails.
         """
         if not self.available:
             return []
@@ -212,13 +214,18 @@ class Brew:
             self._search_cache[term] = []
             return []
         names: list[str] = []
+        in_casks = False
         for line in result.stdout.splitlines():
             line = line.strip()
             if not line:
                 continue
             if line.startswith("==>"):
+                in_casks = line.lower().endswith("casks")
                 continue
-            names.append(line)
+            if in_casks and not line.endswith("(cask)"):
+                names.append(f"{line} (cask)")
+            else:
+                names.append(line)
         self._search_cache[term] = names
         return names
 
