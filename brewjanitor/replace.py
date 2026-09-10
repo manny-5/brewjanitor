@@ -86,6 +86,111 @@ def _remove_bundle(app_path: str) -> tuple[bool, str]:
     return True, ""
 
 
+def reconcile(
+    apps: list[App],
+    brew: Brew | None = None,
+    apply: bool = False,
+    allowed_roots: tuple[str, ...] | None = None,
+    remover=_remove_bundle,
+) -> list[ReplaceResult]:
+    """Detect and clean up leftover old bundles from an interrupted --apply run.
+
+    If a previous `brewjanitor --apply` was killed after a cask install
+    succeeded but before the old bundle was removed, the system now has BOTH
+    the brew-managed app and the original bundle on disk. A normal re-run would
+    see the original as "unmanaged" and try to install it again -- wasteful and
+    confusing. This instead detects the orphan: an app that is NOT brew-managed
+    (the old copy) but where brew now manages a cask whose artifact matches the
+    same bundle_id or .app basename, and removes ONLY the old bundle (no
+    re-install). It is a pure cleanup of a leftover, never a fresh install.
+
+    Safety mirrors replace(): dry-run by default (prints what it would remove),
+    the path guard applies, and removal is the only mutation.
+    """
+    from .brewcheck import _build_brew_ownership
+
+    brew = brew if brew is not None else Brew()
+    roots = allowed_roots if allowed_roots is not None else DEFAULT_SCAN_DIRS
+    results: list[ReplaceResult] = []
+    if not brew.available:
+        return [
+            ReplaceResult(app=a, brew_name="", brew_kind="", status="skipped", reason="brew not available")
+            for a in apps
+        ]
+
+    by_path, by_basename = _build_brew_ownership(brew)
+
+    # Map bundle_id -> brew_name for casks that report one, and basename -> name.
+    by_bundle_id: dict[str, str] = {}
+    for cask in brew.info_installed_all(is_cask=True):
+        token = cask.get("token") or cask.get("full_name") or cask.get("name") or ""
+        bid = cask.get("bundle_identifier", "") or ""
+        if isinstance(token, str) and isinstance(bid, str) and bid:
+            by_bundle_id.setdefault(bid, token)
+
+    for a in apps:
+        # Is the app itself already brew-managed BY PATH? The new brew-installed
+        # copy lives at a path brew owns, so by_path matches it. We deliberately
+        # do NOT use the basename index here: an old bundle at a DIFFERENT path
+        # shares the .app basename with the new copy, but its path is not owned
+        # by brew -- that mismatch is exactly what makes it an orphan.
+        already = by_path.get(_normalize_path(a.path))
+        if already:
+            results.append(
+                ReplaceResult(
+                    app=a, brew_name=already[0], brew_kind=already[1], status="skipped",
+                    reason="already brew-managed (not an orphan)",
+                )
+            )
+            continue
+
+        # Does brew now manage a cask matching this app's bundle_id or basename?
+        # (basename here is fine: it tells us a cask for this app name exists, so
+        # the old bundle is a leftover of that cask's install.)
+        match_name = ""
+        if a.bundle_id and a.bundle_id in by_bundle_id:
+            match_name = by_bundle_id[a.bundle_id]
+        elif a.name and a.name.lower() in by_basename:
+            match_name = by_basename[a.name.lower()][0]
+
+        if not match_name:
+            results.append(
+                ReplaceResult(app=a, brew_name="", brew_kind="", status="skipped", reason="no brew cask owns this app; not an orphan")
+            )
+            continue
+
+        if not apply:
+            results.append(
+                ReplaceResult(
+                    app=a, brew_name=match_name, brew_kind="cask", status="dry-run",
+                    reason=f"leftover from interrupted run: brew now manages {match_name}; would remove old bundle {a.path}",
+                )
+            )
+            continue
+
+        if not _is_safe_to_remove(a.path, roots):
+            results.append(
+                ReplaceResult(app=a, brew_name=match_name, brew_kind="cask", status="failed", reason=f"refusing to remove outside allowed roots: {a.path}")
+            )
+            continue
+
+        removed, why = remover(a.path)
+        status = "replaced" if removed else "failed"
+        reason = f"removed leftover old bundle for {match_name}" + (f": {why}" if why else "")
+        results.append(ReplaceResult(app=a, brew_name=match_name, brew_kind="cask", status=status, reason=reason))
+
+    return results
+
+
+def _normalize_path(path: str) -> str:
+    """Resolve a path for stable comparison (mirror of brewcheck._normalize)."""
+    try:
+        return str(Path(path).resolve(strict=False))
+    except OSError:
+        import os
+        return os.path.normpath(path)
+
+
 def _verify_install(
     app: App, brew: Brew, brew_name: str, is_cask: bool
 ) -> tuple[bool, str]:

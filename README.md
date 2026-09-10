@@ -105,6 +105,26 @@ brewjanitor --offline --apply
 `--offline` is faster but every candidate is `unverified`, so use it only if
 you trust the name matches.
 
+### If you interrupted an `--apply` run
+
+If you stopped `brewjanitor --apply` mid-way (e.g. at a password prompt or with
+Ctrl-C), your apps are safe: nothing is deleted until after an install + verify
+succeeds, so an interruption at most leaves a cask *installed but the old bundle
+not yet removed*. brewjanitor never deletes first.
+
+To find and clean up those leftover old bundles, run:
+
+```bash
+brewjanitor --reconcile              # show what it would remove (dry-run)
+brewjanitor --reconcile --apply       # remove the leftover old bundles
+```
+
+`--reconcile` detects apps that are now brew-managed (the new copy) but where
+the *old* bundle is still on disk at a different path, and removes only the old
+bundle. It **never re-installs** anything — it's a pure cleanup of a leftover.
+The same path guard applies (only removes inside `/Applications` or
+`~/Applications`).
+
 ---
 
 ## Scheduled upgrades (autoupdate)
@@ -162,6 +182,8 @@ Logs of each run go to `~/Library/Logs/brewjanitor/autoupdate.log`.
 | `brewjanitor --report X.csv` | Prints a plan + writes the can't-replace list to a CSV | No (only writes the CSV you named) |
 | `brewjanitor --apply` | Installs via brew, verifies, removes old bundles | **Yes** |
 | `brewjanitor --offline` | Skips `brew info` verification (faster, less sure) | Only with `--apply` |
+| `brewjanitor --reconcile` | Finds leftover old bundles from an interrupted run | No |
+| `brewjanitor --reconcile --apply` | Removes those leftover old bundles | Yes (deletes old bundles) |
 | `brewjanitor autoupdate --install` | Schedules a daily `brew upgrade` (user-level launchd) | Yes (writes one plist to ~/Library/LaunchAgents) |
 | `brewjanitor autoupdate --remove` | Removes the scheduled job | Yes (deletes that plist) |
 
