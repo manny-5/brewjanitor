@@ -3,7 +3,7 @@
 **brewjanitor** brings the software on your Mac into the fold of [Homebrew](https://brew.sh).
 
 It scans your Mac for installed apps, figures out which ones Homebrew already
-manages, and for the rest, checks whether Homebrew *could* install them. When
+manages, and for the rest, checks whether Homebrew could install them. When
 it can, brewjanitor offers to replace the app with a Homebrew-managed copy
 (install the new one first, verify it, then remove the old one). Apps that
 Homebrew can't install are left alone and listed in a report.
@@ -93,7 +93,7 @@ and takes ownership of it **in place** — so the usual outcome deletes nothing 
 all. The removal step only runs in the genuine leftover case: your copy is in
 `~/Applications` while the cask installs to `/Applications`.
 
-If an install or a verification fails, the old app is **left untouched**. It
+If an install or a verification fails, the old app is left untouched. It
 also refuses to remove anything outside `/Applications` or `~/Applications`.
 
 One limitation worth knowing: Homebrew will only adopt a bundle whose version
@@ -110,19 +110,19 @@ ids the cask names in its `uninstall`/`zap` directives** (e.g.
 `CFBundleIdentifier`.
 
 Because a pkg installer does not report a single install path, brewjanitor
-**never removes the original bundle for a pkg cask**, even when verification
+never removes the original bundle for a pkg cask, even when verification
 succeeds. A bundle-id match confirms brew manages an app of that identity, but
-it cannot prove the `.app` at the original path is a *separate* copy rather than
+it cannot prove the `.app` at the original path is a separate copy rather than
 the very one brew installed — deleting it would risk removing brew's own copy.
 So a verified pkg-cask install is reported as `replaced` (installed in place,
 nothing removed) and the removal path is skipped entirely. `--reconcile`
 applies the same rule: a bundle whose only match is a pkg cask is reported as
 `skipped` for manual inspection, never removed.
 
-> ⚠️ `--apply` changes your system (it runs `brew install`, and in the leftover
+>`--apply` changes your system (it runs `brew install`, and in the leftover
 > case deletes an old `.app` bundle). Read the dry-run output first.
 
-### Fast check (no network)
+### Fast check
 
 The default run matches casks by name, which is fast. Under `--apply`,
 brewjanitor verifies each match with a `brew info` call (which can hit the
@@ -151,11 +151,11 @@ brewjanitor --reconcile --apply       # remove the leftover old bundles
 
 `--reconcile` detects apps that are now brew-managed (the new copy) but where
 the *old* bundle is still on disk at a different path, and removes only the old
-bundle. It **never re-installs** anything — it's a pure cleanup of a leftover.
+bundle. It never re-installs anything — it's a pure cleanup of a leftover.
 The same path guard applies (only removes inside `/Applications` or
 `~/Applications`).
 
-Matching is on **bundle identifier only**, never on the `.app` filename. Two
+Matching is on bundle identifier only, never on the `.app` filename. Two
 apps sharing a name are not the same app: if you keep a beta or a pinned old
 build in `~/Applications` alongside a cask-installed copy in `/Applications`,
 a filename rule would call your second copy a leftover and delete it.
@@ -168,14 +168,14 @@ brewjanitor can install a daily `brew update && brew upgrade` job using macOS's
 built-in scheduler (`launchd`). It is fully user-level and auditable:
 
 - The job lives in **`~/Library/LaunchAgents/`** (your own home folder), never
-  the system folder, so it runs as **you** with **your** permissions and never
+  the system folder, so it runs as you with your permissions and never
   needs `sudo`.
-- The file is **plain XML** — open it and read the whole thing before you trust
+- The file is plain XML — open it and read the whole thing before you trust
   it. The only command it ever runs is `brew` (update, upgrade, optionally
   `--greedy`/`--cleanup`). Nothing else is downloaded or executed.
-- The absolute path to **your** `brew` is baked in, so it runs the same brew you
+- The absolute path to your `brew` is baked in, so it runs the same brew you
   use interactively.
-- Installing it does **not** run an upgrade immediately (`RunAtLoad` is off);
+- Installing it does not run an upgrade immediately (`RunAtLoad` is off);
   it only fires at the scheduled time.
 
 ### Install the daily upgrade
@@ -201,7 +201,7 @@ brewjanitor autoupdate --remove     # unload and delete the job (no sudo)
 
 Logs of each run go to `~/Library/Logs/brewjanitor/autoupdate.log`.
 
-> ⚠️ `--greedy` upgrades casks that auto-update themselves (browsers, VS Code,
+> `--greedy` upgrades casks that auto-update themselves (browsers, VS Code,
 > etc.) and may quit a running app to replace it. Omit it for a gentler daily
 > upgrade. To protect a specific package from ever being upgraded, pin it:
 > `brew pin <name>`.
@@ -276,7 +276,7 @@ brewjanitor formulae --all              # sweep every directory on PATH
 ```
 
 Reports which of your manually installed command-line tools Homebrew has a
-formula for. **It never installs and never deletes**, and there is no flag that
+formula for. It never installs and never deletes, and there is no flag that
 makes it.
 
 That asymmetry with the app pipeline is deliberate. Replacing an app is safe
@@ -284,17 +284,16 @@ because three things line up: an app has a `CFBundleIdentifier` that Homebrew
 records, a cask maps to exactly one `.app`, and `--adopt` lets brew take
 ownership of the bundle already on disk. None of that holds for formulae:
 
-- A command-line tool has **no identity**. A file named `python3` is just a
+- A command-line tool has no identity. A file named `python3` is just a
   name, and name matching is exactly what produced the `R.app` → `r` false
   match the cask path had to stop making.
-- A formula owns **hundreds of files** across `bin/`, `lib/`, `include/` and
+- A formula owns hundreds of files across `bin/`, `lib/`, `include/` and
   `share/`, so "replace this binary" is not a well-defined operation.
-- There is **no `--adopt` for formulae**. Homebrew installs into its own prefix,
+- There is no `--adopt` for formulae. Homebrew installs into its own prefix,
   so a "replacement" would leave both copies on disk with `PATH` order silently
   deciding which one runs.
 
-So it reports, and you decide. The output ends with the exact `brew install`
-commands, to run yourself if you want them.
+The output ends with the exact `brew install` commands, to run yourself if you want them.
 
 ### What gets filtered out
 
@@ -343,7 +342,7 @@ Two related hardening measures, useful on a beta and harmless otherwise:
 - Read-only calls run with `HOMEBREW_NO_AUTO_UPDATE=1`, so a long scan cannot
   stall partway through on an unannounced `brew update`. Installs keep
   auto-update, since they genuinely want fresh cask metadata.
-- Under `--apply`, brew's output is **shown, not swallowed**. Previously both
+- Under `--apply`, brew's output is shown, not swallowed. Previously both
   streams were captured, so a cask whose installer asks for a password looked
   like a hang — the prompt went into a pipe nobody displayed. stdout and stdin
   are now inherited and stderr is teed, so you see warnings and progress live
