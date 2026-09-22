@@ -33,7 +33,7 @@ brew --version
 From a clone of this repo:
 
 ```bash
-git clone https://github.com/manny222manny/brewjanitor
+git clone https://github.com/manny-5/brewjanitor
 cd brewjanitor
 python3 -m pip install -e .
 ```
