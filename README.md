@@ -17,7 +17,7 @@ anything.
 
 - A Mac (it reads `.app` bundles from `/Applications` and `~/Applications`).
 - [Homebrew](https://brew.sh) installed and on your `PATH` (the `brew` command).
-- Python 3.9 or newer.
+- Python 3.10 or newer.
 
 You can check both with:
 
@@ -224,7 +224,7 @@ Logs of each run go to `~/Library/Logs/brewjanitor/autoupdate.log`.
 
 ---
 
-## How it works (the six pieces)
+## How it works (the eight pieces)
 
 brewjanitor is built in stages, each safe to run on its own:
 

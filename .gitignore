@@ -15,3 +15,4 @@ dist/
 .venv/
 venv/
 brewjanitor-unreplaced.csv
+.DS_Store
