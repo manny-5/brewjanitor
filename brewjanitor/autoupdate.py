@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -55,10 +56,11 @@ def _command_line(brew_path: str, greedy: bool, cleanup: bool) -> str:
     drift: the line you are shown is built from the same code that goes into
     the job, not reconstructed alongside it.
     """
-    upgrade = f"{brew_path} upgrade" + (" --greedy" if greedy else "")
-    steps = [f"{brew_path} update", upgrade]
+    command = shlex.quote(brew_path)
+    upgrade = f"{command} upgrade" + (" --greedy" if greedy else "")
+    steps = [f"{command} update", upgrade]
     if cleanup:
-        steps.append(f"{brew_path} cleanup")
+        steps.append(f"{command} cleanup")
     return " && ".join(steps)
 
 

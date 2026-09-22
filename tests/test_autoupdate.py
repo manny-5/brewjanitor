@@ -88,6 +88,22 @@ class TestBuildPlist(HomeRedirected):
         command = self._plist(cleanup=True)["ProgramArguments"][-1]
         self.assertEqual(command, f"{BREW} update && {BREW} upgrade && {BREW} cleanup")
 
+    def test_brew_path_is_shell_quoted(self):
+        path = "/tmp/brew tools/brew;echo unsafe"
+        command = self._plist(brew_path=path)["ProgramArguments"][-1]
+        self.assertEqual(
+            command,
+            "'/tmp/brew tools/brew;echo unsafe' update && "
+            "'/tmp/brew tools/brew;echo unsafe' upgrade",
+        )
+        cleanup = self._plist(brew_path=path, cleanup=True)["ProgramArguments"][-1]
+        self.assertEqual(
+            cleanup,
+            "'/tmp/brew tools/brew;echo unsafe' update && "
+            "'/tmp/brew tools/brew;echo unsafe' upgrade && "
+            "'/tmp/brew tools/brew;echo unsafe' cleanup",
+        )
+
     def test_label_is_stable_and_logs_go_under_the_user_home(self):
         p = self._plist()
         self.assertEqual(p["Label"], autoupdate.LABEL)
